@@ -263,6 +263,10 @@ def main() -> int:
                     help="forza il numero di persone distinte nel video")
     ap.add_argument("--det-size", type=int, default=640, choices=[160, 320, 640])
     ap.add_argument("--blend", type=int, default=9, help="sfumatura maschera (headswap)")
+    ap.add_argument("--harmonize", type=float, default=1.0,
+                    help="0 disattiva l'armonizzazione del tono pelle (headswap)")
+    ap.add_argument("--temporal", type=float, default=0.35,
+                    help="0 disattiva lo smorzamento temporale (0-1, headswap)")
     ap.add_argument("--crf", type=int, default=17)
     ap.add_argument("--limit-frames", type=int, default=0, help="test: procesa N frame")
     ap.add_argument("--save-masks", type=Path, help="salva le maschere del primo frame")
@@ -316,7 +320,8 @@ def main() -> int:
     if mode == "headswap":
         from head_swap import HeadSwapper
         swapper = HeadSwapper(DL_DIR / "models", providers, M["swapper"].swap_face,
-                              mode="headswap", blend=args.blend)
+                              mode="headswap", blend=args.blend,
+                              harmonize=args.harmonize, temporal=args.temporal)
         log("[headswap] parser BiSeNet pronto\n")
     entries = [swapper.prepare_source(img, face) for _, img, face in loaded] if swapper else None
 
@@ -346,14 +351,19 @@ def main() -> int:
         labels, cut = cluster_identities([t["embedding"] for t in tracks], args.identities)
         groups: dict[int, dict] = {}
         for lbl, t in zip(labels, tracks):
-            gr = groups.setdefault(int(lbl), {"embedding": [], "count": 0})
+            gr = groups.setdefault(int(lbl), {"embedding": [], "count": 0, "first": None})
             gr["embedding"].append(t["embedding"])
             gr["count"] += t["count"]
+            f = min(str(m["frame"]) for m in t["members"])
+            if gr["first"] is None or f < gr["first"]:
+                gr["first"] = f
         people = []
         for gr in groups.values():
             people.append({"centroid": np.mean(np.vstack(gr["embedding"]), axis=0),
-                           "count": gr["count"]})
-        people.sort(key=lambda x: -x["count"])
+                           "count": gr["count"], "first": gr["first"]})
+        # come nel referto, le persone sono numerate in ordine di prima
+        # apparizione: "persona 1" e' la prima che si vede nel video
+        people.sort(key=lambda x: x["first"])
 
         if args.mapping:
             sel = [int(x) for x in args.mapping.split(",")]
@@ -372,9 +382,10 @@ def main() -> int:
         for i, (p, s) in enumerate(zip(people, sel)):
             log(f"    persona {i+1} -> {photos[s].name}   ({p['count']} rilevamenti)")
         if not args.mapping:
-            log("\n  NOTA: abbinamento automatico per frequenza. Se i soggetti delle foto")
-            log("  non sono gia' nel video non e' verificabile: usa video_face_roster.py")
-            log("  e poi --map per fissarlo a mano.\n")
+            log("\n  NOTA: le persone sono in ordine di apparizione e le foto vengono")
+            log("  abbinate in quell'ordine. Se i soggetti delle foto non sono gia'")
+            log("  nel video l'abbinamento non e' verificabile da solo: usa")
+            log("  video_face_roster.py e poi --map per fissarlo a mano.\n")
 
         centroids = np.vstack([p["centroid"] for p in people])
         t0 = time.time()

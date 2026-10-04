@@ -118,3 +118,26 @@ def inner_face_mask(img_shape, kps, scale: float = 1.0) -> np.ndarray:
                 (int(abs(span[0]) * scale), int(abs(span[1]) * scale)),
                 float(np.degrees(np.arctan2(span[1], span[0]))), 0, 360, 255, -1)
     return mask
+
+
+def landmark_head_mask(img_shape, kps, grow_x: float = 0.55,
+                       grow_y_up: float = 0.75) -> np.ndarray:
+    """Testa approssimata dai soli 5 landmark del viso.
+
+    Serve quando il segmentatore produce una maschera implausibile. Diversamente
+    da BiSeNet non indovina nulla: e' un'ellisse centrata sui 5 landmark e
+    scalata, quindi segue il movimento del volto per costruzione.
+    """
+    mask = np.zeros(img_shape[:2], np.uint8)
+    pts = np.asarray(kps, np.float32)
+    if pts.shape[0] < 5:
+        return mask
+    centre = pts[:4].mean(axis=0)
+    span = pts[2] - pts[0]
+    ax = max(8.0, abs(float(span[0])) * (1.0 + grow_x))
+    ay = max(8.0, abs(float(span[1])) * (1.0 + grow_y_up))
+    # il centro va spostato in alto per includere capelli e fronte
+    cy = centre[1] - ay * grow_y_up * 0.45
+    cv2.ellipse(mask, (int(centre[0]), int(cy)), (int(ax), int(ay)),
+                0, 0, 360, 255, -1)
+    return mask

@@ -6,6 +6,9 @@ su macOS/Linux oppure su **Colab/Kaggle**, senza API a pagamento.
 Stack: **Deep-Live-Cam** (ex Roop) + **InsightFace** + modelli **ONNX**.
 Nessun modello generativo di testo: vedi [Prompt](#prompt).
 
+Documenti: [GOAL.MD](GOAL.MD) (obiettivo, vincoli, cosa non è risolto) ·
+[ARCHITECTURE.MD](ARCHITECTURE.MD) (layer, modelli, algoritmo, flusso dati)
+
 > **Repository privato.** I media di prova raffigurano persone identificabili e
 > non vengono versionati (vedi `.gitignore`). `inswapper_128` è rilasciato per
 > ricerca non commerciale: verifica la licenza prima di qualsiasi uso.
@@ -27,19 +30,32 @@ e questo fa BiSeNet (19 classi).
 
 Video di prova 720x1280, 24 fps, 409 frame, 17.04 s, macOS Intel (CoreML).
 
-| Modalità | Identità residua | Zona volto | Fuori volto | Durata | Audio |
-|---|---|---|---|---|---|
-| originale | 0.961 | — | — | 17.16 s | sì |
-| `faceswap` | **0.373** | 5.05 | 1.72 | 17.04 s | AAC 2ch |
-| `headswap` | **0.214** | 30.21 | 1.80 | 17.04 s | AAC 2ch |
+| Modalità | Identità residua | Area testa | Movimento | Fuori volto | Durata | Audio |
+|---|---|---|---|---|---|---|
+| originale | 0.988 | — | — | — | 17.16 s | sì |
+| `headswap` (3 foto) | **0.360** | **0.98x** | **98%** | 1.36 | 17.04 s | AAC 2ch |
 
 *Identità residua* = `1 - coseno(embedding(volto in output), embedding(foto))`.
 Valore alto (~0.9) = il volto è ancora quello originale, nessuno swap.
 Valore basso (~0.2) = il volto è stato sostituito.
 
-`headswap` vince perché trasferisce anche capelli e pelle della fonte, quindi
-l'identità risultante è più coerente di un volto innestato nel capello altrui.
-Entrambe lasciano lo sfondo intatto (≤ 1.80/255) e preservano durata e audio.
+*Area testa* = rapporto fra l'area della testa nell'output e nell'originale.
+*Movimento* = quanto varia il contenuto nella testa rispetto al video
+originale: 100% = si muove esattamente come il video.
+
+L'head swap **non trapianta la testa della foto**: `inswapper` rigenera il
+volto nella posa e nella posa del target, i capelli restano quelli del video e
+ne viene solo allineato il colore. È il comportamento corretto: la
+letteratura di riferimento (SimSwap, ACM MM 2020) osserva che introdurre i
+capelli della fonte «non è desiderato, visto che stiamo sostituendo solo i
+volti». Un'area testa pari a 0.98x e un movimento al 98% confermano che
+niente è rimasto statico o sproporzionato.
+
+Prima versione (rigettata in test visivo): l'area della testa oscillava da
+0.36x a **15.31x** e il contenuto risultava immobile. I due difetti — maschere
+BiSeNet senza vincolo di area e recolor su maschere binarie — sono corretti.
+
+Output corrente: `~/Downloads/TestFaceSwap/headswap_3foto.mp4`.
 
 ## Installazione
 
@@ -94,23 +110,33 @@ diventare obsoleto rispetto alla CLI.
 | `--prompt "..."` | registra il prompt nel config (vedi sotto) |
 | `--no-enhancer` | salta GFPGAN, più veloce |
 | `--provider cuda\|coreml\|cpu` | forza il provider ONNX |
+| `--temporal 0.35` | smorzamento temporale contro il flickering (0 = off) |
+| `--harmonize 1.0` | allineamento del tono pelle (0 = off) |
 | `--limit-frames N` | prova rapida sui primi N frame |
 | `--save-masks DIR` | salva maschere e viste di debug |
 
 ## Come viene scelto chi è chi
 
 **Non è possibile sapere automaticamente a chi appartiene il soggetto delle
-tue foto.** L'abbinamento automatico è per frequenza di comparse nel video.
+tue foto.** Il confronto fra una foto e un volto del video dà distanze
+embedding molto alte (0.90+): non è un errore, significa che sono persone
+diverse.
 
-Il confronto fra una foto e un volto del video dà distanze embeddings molto
-alte (0.90+): non è un errore, significa che sono persone diverse. Quindi:
+Le persone sono numerate **in ordine di prima apparizione** nel video:/persona
+1` è la prima che si vede, `persona 2` la successiva, e così via. Le foto
+vengono abbinate in quello stesso ordine. Nessun soggetto è codificato nel
+codice: con N foto e M persone si abbinano le prime N, e `--map` permette di
+correggere a mano.
 
 1. `video_face_roster.py` raggruppa i volti del video e produce un provino
    (`persona_N_provino.png`) per ogni persona.
-2. Tu riconosci le persone e o editi `swap_config.json`, oppure passi `--map`.
+2. Tu riconosci le persone dal provino e passi `--map` (indici delle foto
+   in ordine di persona), oppure editi `swap_config.json`.
 
-Su un video a due persone il risultato è 4 identità, con le due dominanti a 43
-e 24 apparizioni: le altre sono frammenti dello stesso soggetto in pose diverse.
+Il numero di persone trovate non è il numero di persone reali: su questo
+video il clustering dà 5 identità per 2-3 soggetti, perché le embedding
+ cambiano sensibilmente con la posa. Le identità marginali (poche
+apparizioni) sono di solito frammenti dello stesso soggetto.
 
 ### Raggruppamento
 
@@ -156,17 +182,60 @@ Il prompt viene comunque registrato in `swap_config.json` con il flag
 
 ## Come funziona l'head swap
 
-1. `inswapper` sostituisce il volto interno, prendendo l'identità dalla foto.
-2. BiSeNet segmenta foto e video in 19 classi, separando capelli, orecchie e
-   cappello da collo e abbigliamento.
-3. La testa della foto viene warpiata sulla geometria del target tramite
-   similar-transform dei 5 landmark.
-4. Il bordo viene sfumato; **il collo è protetto** e lo sfondo non viene
-   toccato.
+1. `inswapper` sostituisce il volto interno, prendendo l'identità dalla foto e
+   **rispettando la posa e il movimento del target**.
+2. BiSeNet segmenta foto e video in 19 classi, separando capelli e pelle da
+   collo e abbigliamento.
+3. Il colore di capelli e pelle viene allineato a quello della foto **riscalando
+   e traslando i pixel**: la struttura spaziale resta quella del video, quindi
+   un capello che si muove continua a muoversi e cambia solo il colore.
+4. La miscelazione passa per una maschera sfumata, non per una selezione
+   binaria: con una soglia il ricolor lasciava un bordo netto, visibile come un
+   contorno attorno a capelli e pelle.
+5. Il bordo viene sfumato, il **collo è protetto** e lo sfondo non viene toccato.
+6. `--temporal` (attivo, 0.35) mescola il fotogramma precedente, portato nella
+   posizione attuale con i landmark, per ridurre il flickering.
 
-Il colore della pelle viene allineato all'illuminazione del target, ma **solo
-sui pixel della testa di riferimento**: applicarlo all'intero frame sporcherebbe
-il video (in una versione intermedia sporcava il fondo di 53/255).
+### Dettagli tecnici che hanno fatto la differenza
+
+- **`emap`**: l'embedding del volto di riferimento va moltiplicato per una
+  matrice 512×512 salvata come ultimo initializer del grafo ONNX, poi
+  rinormalizzato. Senza, il modello non riceve l'identità e l'output resta il
+  volto target pressoché invariato.
+- **Normalizzazione**: l'input è RGB diviso per 255, quindi in `[0, 1]`
+  (equivalente a `blobFromImage` con `swapRB=True`, `mean=0`, `std=255`).
+  Non `[-1, 1]`: la conversione sbagliata sballa i colori e l'identità non
+  viene più riconosciuta.
+- **Divisione per zero**: il ricolor calcola la deviazione standard della
+  regione; se è zero (pixel uniformi) produce NaN e pixel corrotti. Va protetta
+  con un epsilon.
+
+### Modelli alternativi valutati
+
+`swappers.py` implementa un adapter per scambiatori intercambiabili. Sono
+state scaricate e provate le varianti `simswap_256`, `hififace_256` e
+`gpen_bfr_256` (encoder) dagli asset FaceFusion.
+
+`inswapper` funziona. **`simswap` e `hififace` non sono utilizzabili** con
+l'identificatore di Deep-Live-Cam: non è un problema di normalizzazione
+(verificate tutte le varianti) ma un mismatch di modello, perché sono stati
+addestrati con un ArcFace diverso e l'embedding non è compatibile. Per usarli
+servirebbe il loro modello di riconoscimento, non disponibile negli asset
+consultati. `swappers.py` resta un modulo sperimentale non usato dalla
+pipeline.
+
+La stabilità temporale è il limite noto della letteratura: "Temporal
+Optimization for Face Swapping Video based on Consistency Inheritance"
+(ACM MM 2024) la tratta come un disturbo nel dominio del tempo e la risolve
+riaddestrando il modello, che qui non è pratico. `--temporal` ne recupera una
+parte senza modelli aggiuntivi.
+
+### Limite della verifica
+
+`verifica_swap.py` accetta **un solo** `--rif`. Con più foto va eseguito una
+volta per persona, altrimenti dà esiti fuorvianti: confronta un volto
+sostituito con la foto di un'altra persona e segnala un falso fallimento. Non
+è ancora legato al `--map` usato per generare il video.
 
 ## Limiti noti
 

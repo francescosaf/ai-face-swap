@@ -37,7 +37,15 @@ sys.path.insert(0, str(HERE / "dlfolder"))
 IDENTITA_OK = 0.45      # sotto questa soglia il volto e' davvero stato sostituito
 IDENTITA_MIGLIORE = 0.30
 SFONDO_MAX = 8.0        # oltre, il composite tocca il fondo
-DISTRUZIONE_MAX = 130.0  # oltre, la zona volto e'rumore
+DISTRUZIONE_MAX = 130.0  # oltre, la zona volto e' rumore
+AREA_MAX = 1.8          # oltre, la testa e' piu' grande dell'originale
+AREA_MIN = 0.6          # sotto, e' sparita
+MUOVIMENTO_MIN = 0.35   # sotto, il contenuto non segue il video: resta una foto
+
+
+def ratio_movimento(a: np.ndarray, b: np.ndarray) -> float:
+    """Quanto varia il contenuto fra due frame, normalizzato sul range 0-255."""
+    return float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean() / 255.0)
 
 
 def grab(path: Path, idx: int):
@@ -101,13 +109,25 @@ def main() -> int:
         return 1
     e_rif = get_one_face(rif).normed_embedding
 
+    from face_parsing import FaceParser, HEAD_CLASSES
+    parser = FaceParser(HERE / "dlfolder" / "models")
+
+    def area_testa(img):
+        if img is None:
+            return None
+        fs = bbox_face(img)
+        if fs is None:
+            return None
+        lab, _ = parser.parse(img, tuple(int(v) for v in fs))
+        return int(np.isin(lab, list(HEAD_CLASSES)).sum())
+
     campioni = []
     for i in args.frame:
         a = grab(args.videoorig, i)
         b = grab(args.videoswap, i)
         if a is None or b is None:
             continue
-        campioni.append((i, a, b))
+        campioni.append((i, a, b, area_testa(a), area_testa(b)))
 
     if not campioni:
         print("[errore] nessun frame confrontabile")
@@ -116,10 +136,12 @@ def main() -> int:
     print("=" * 70)
     print(f"  VERIFICA {args.modalita.upper()}   riferimento: {args.rif.name}")
     print("=" * 70)
-    print(f"  {'frame':>6} {'orig vs rif':>13} {'swap vs rif':>13} {'variazione':>12}")
-    print("  " + "-" * 46)
+    print(f"  {'frame':>6} {'orig vs rif':>13} {'swap vs rif':>13} "
+          f"{'variazione':>12} {'area testa':>11}")
+    print("  " + "-" * 57)
     d_o, d_s, d_face, d_bg = [], [], [], []
-    for i, a, b in campioni:
+    aree = []
+    for i, a, b, ao, ah in campioni:
         oa, ob = identita(a, e_rif), identita(b, e_rif)
         box = bbox_face(a)
         if oa is None or ob is None or box is None:
@@ -128,8 +150,10 @@ def main() -> int:
         fm = maschera(a.shape, box)
         d_o.append(oa); d_s.append(ob)
         d_face.append(mad(a, b, fm)); d_bg.append(mad(a, b, ~fm))
-        print(f"  {i:>6} {oa:>13.3f} {ob:>13.3f} {oa-ob:>12.3f}")
-    print("  " + "-" * 46)
+        r = f"{ah/ao:>10.2f}x" if (ao and ah and ao > 0) else f"{'-':>10}"
+        aree.append(ah / ao if (ao and ah and ao > 0) else None)
+        print(f"  {i:>6} {oa:>13.3f} {ob:>13.3f} {oa-ob:>12.3f} {r:>11}")
+    print("  " + "-" * 57)
 
     if not d_s:
         print("[errore] nessun volto rilevato nell'output")
@@ -139,6 +163,10 @@ def main() -> int:
     print(f"\n  identita' residua media : originale {mo:.3f} -> swap {ms:.3f}")
     print(f"  zona volto  (pixel)     : {np.mean(d_face):.2f}")
     print(f"  fuori volto (pixel)     : {np.mean(d_bg):.2f}")
+    valid = [r for r in aree if r]
+    if valid:
+        print(f"  area testa  (rapporto)  : {np.median(valid):.2f}x "
+              f"(min {min(valid):.2f}x, max {max(valid):.2f}x)")
 
     esito = []
     if ms >= IDENTITA_OK:
@@ -151,11 +179,43 @@ def main() -> int:
                      f"il composite tocca il fondo")
     if np.mean(d_face) > DISTRUZIONE_MAX:
         esito.append(f"FALLITO: la zona volto e' distrutta ({np.mean(d_face):.2f})")
-    if args.modalita == "headswap" and np.mean(d_face) < 12:
-        esito.append("ATTENZIONE: i capelli non sembrano trasferiti, "
-                     "la zona testa cambia poco")
+    # Nell'head swap la testa NON viene trapiantata: geometria, capelli e
+    # sfondo restano quelli del target e cambia solo il volto (piu' il
+    # colore dei capelli). Un cambiamento grande nella zona testa sarebbe
+    # quindi un difetto, non una riuscita: il controllo segnala solo il caso
+    # opposto, cioe' che non e' cambiato quasi nulla e lo swap non si vede.
+    if args.modalita == "headswap" and np.mean(d_face) < 2:
+        esito.append("ATTENZIONE: la zona volto e' quasi invariata, "
+                     "lo swap non si vede")
+    if valid:
+        if max(valid) > AREA_MAX:
+            esito.append(f"FALLITO: la testa arriva a {max(valid):.1f}x dell'originale: "
+                         f"contenuto incollato troppo grande")
+        if min(valid) < AREA_MIN:
+            esito.append(f"FALLITO: la testa scende a {min(valid):.2f}x dell'originale: "
+                         f"contenuto sparito")
 
-    print("\n  " + "=" * 46)
+    # movimento: il contenuto della testa deve variare quanto quello del video.
+    if len(campioni) >= 2:
+        mov_o, mov_s = [], []
+        for (i, a, b, _, _), (j, a2, b2, _, _) in zip(campioni, campioni[1:]):
+            if j == i:
+                continue
+            fm_a = bbox_face(a); fm_b = bbox_face(b)
+            if fm_a is None or fm_b is None:
+                continue
+            ma = maschera(a.shape, fm_a); mb = maschera(b.shape, fm_b)
+            mov_o.append(ratio_movimento(a[ma], a2[ma]))
+            mov_s.append(ratio_movimento(b[mb], b2[mb]))
+        if mov_o and np.mean(mov_o) > 1e-6:
+            k = np.mean(mov_s) / np.mean(mov_o)
+            print(f"  movimento testa         : {np.mean(mov_o)*100:5.1f}% -> "
+                  f"{np.mean(mov_s)*100:5.1f}% del video ({k*100:.0f}%)")
+            if k < MUOVIMENTO_MIN:
+                esito.append(f"FALLITO: il contenuto si muove solo al {k*100:.0f}% "
+                             f"rispetto al video: sembra una foto statica incollata")
+
+    print("\n  " + "=" * 57)
     if esito:
         for e in esito:
             print(f"  {e}")

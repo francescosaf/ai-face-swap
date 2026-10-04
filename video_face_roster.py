@@ -196,7 +196,12 @@ def build_roster(samples: list[Path], get_many_faces, force_k: int = 0) -> tuple
         g["samples"].extend(t["members"])
         g["count"] += t["count"]
     out = []
-    for g in sorted(groups.values(), key=lambda x: -x["count"]):
+    # L'ordine dei numeri persona segue la prima apparizione nel video, non la
+    # frequenza: "persona 1" deve essere la prima persona che si vede, cosi'
+    # il numero nel referto corrisponde all'ordine in cui si vedono le persone
+    # e le foto di riferimento si abbinano senza dover indovinare.
+    for g in sorted(groups.values(),
+                    key=lambda x: min(str(m["frame"]) for m in x["samples"])):
         g["samples"].sort(key=lambda m: str(m["frame"]))
         g["id"] = len(out)
         out.append(g)
