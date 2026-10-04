@@ -15,19 +15,16 @@ dentro restava la fotografia. Misurato: rapporto d'area della testa fino a
 15.3x rispetto all'originale, e capelli che comparivano anche dove non c'era
 volto.
 
-Cosa fa invece (v3 — quality high/maximum)
------------------------------------------
-1. Maschera SEMANTICA (BiSeNet: skin+naso+occhi+bocca+labbra) invece
-   della sola ellisse dei 5 landmark → copertura precisa del naso.
+Cosa fa invece (v3.1 stabile)
+----------------------------
+1. Maschera ellipse-first + rinforzo semantico leggero (evita melting).
 2. `inswapper` rigenera il volto interno nella posa del target.
-3. Upscale selettivo della regione facciale (1.6x–2.0x) prima del
-   post-processing → più dettaglio senza upscalare tutto il video.
+3. Upscale selettivo moderato della regione facciale (1.25x–1.5x).
 4. Ricoloratura capelli/pelle in spazio LAB.
-5. Poisson blending (seamlessClone MIXED) con maschera semantica.
-6. Temporal smoothing REGIONALE: occhi/naso/bocca pesano solo il 40%
-   del valore globale → meno ghosting sui dettagli.
+5. Poisson blending leggero (peso 0.55) per integrare senza distorcere.
+6. Temporal smoothing REGIONALE: occhi/naso/bocca pesano solo il 40%.
 7. Il collo non viene mai toccato.
-Profili: --quality fast | high (default) | maximum
+Profili: --quality fast | high (default, stabile) | maximum
 
 
 Nessun modello generativo di testo e' coinvolto: gli ONNX disponibili per il
@@ -90,13 +87,13 @@ class HeadSwapper:
     # Profili di qualità predefiniti
     QUALITY = {
         "fast":     {"blend": 9,  "temporal": 0.25, "face_scale": 1.0, "poisson": False, "semantic": False},
-        "high":     {"blend": 13, "temporal": 0.38, "face_scale": 1.6, "poisson": True,  "semantic": True},
-        "maximum":  {"blend": 15, "temporal": 0.42, "face_scale": 2.0, "poisson": True,  "semantic": True},
+        "high":     {"blend": 12, "temporal": 0.32, "face_scale": 1.25, "poisson": True,  "semantic": True},
+        "maximum":  {"blend": 14, "temporal": 0.38, "face_scale": 1.5,  "poisson": True,  "semantic": True},
     }
 
     def __init__(self, models_dir, providers, swapper_fn, mode: str = "headswap",
                  blend: int = 13, harmonize: float = 1.0, temporal: float = 0.38,
-                 face_scale: float = 1.6, use_poisson: bool = True,
+                 face_scale: float = 1.25, use_poisson: bool = True,
                  use_semantic: bool = True, quality: str | None = None):
         if quality and quality in self.QUALITY:
             q = self.QUALITY[quality]
@@ -199,6 +196,74 @@ class HeadSwapper:
         return np.clip(dst.astype(np.float32) * (1.0 - a) + new_bgr.astype(np.float32) * a,
                        0, 255).astype(np.uint8)
 
+    def _transfer_hair(self, out: np.ndarray, src_entry: dict, target_face,
+                       head: np.ndarray, inner: np.ndarray) -> np.ndarray:
+        """Trasferisce la GEOMETRIA dei capelli dalla foto al target.
+
+        Il solo ricoloramento non basta per un head swap: i capelli restano
+        quelli del video e il risultato si legge come un face swap. Qui la
+        capigliatura della fonte viene allineata al volto del target e
+        incollata, ma solo dove BiSeNet dice che ci sono capelli, limitata
+        alla testa del target, escluso il volto (che gestisce inswapper) e
+        il collo. Il tono viene poi riallineato all'illuminazione del video,
+        altrisi sembrerebbe un collage.
+
+        Il trapianto e' voluto, ma circoscritto: la prima versione incollava
+        l'intera testa e l'area raggiungeva il 15.3x dell'originale.
+        """
+        from insightface.utils import face_align
+
+        src_img = src_entry.get("img")
+        if src_img is None:
+            return out
+
+        M_src = face_align.estimate_norm(np.asarray(src_entry["kps"], np.float32), 112)
+        M_tgt = face_align.estimate_norm(np.asarray(target_face.kps, np.float32), 112)
+        A = np.vstack([M_tgt, [0, 0, 1]]) @ np.linalg.inv(np.vstack([M_src, [0, 0, 1]]))
+
+        h, w = out.shape[:2]
+        hair_src = src_entry.get("hair_mask")
+        if hair_src is None or not hair_src.any():
+            return out
+
+        capelli = cv2.warpAffine(hair_src, A[:2], (w, h), flags=cv2.INTER_LINEAR,
+                                 borderValue=0)
+        sorgente = cv2.warpAffine(src_img, A[:2], (w, h), borderValue=0)
+
+        # solo capelli, dentro la testa del target, fuori volto e fuori collo
+        alpha = cv2.bitwise_and(capelli, head)
+        alpha = cv2.bitwise_and(alpha, cv2.bitwise_not(inner))
+        alpha = cv2.bitwise_and(alpha, cv2.bitwise_not(self._neck_neighbour))
+        if int((alpha > 0).sum()) < 120:
+            return out
+
+        # il bordo e' sfumato su due lati: dentro (dove incontra il volto
+        # generato) e fuori (dove incontra lo sfondo)
+        alpha = cv2.GaussianBlur(alpha, (0, 0), 3.0)
+        a = np.clip(alpha.astype(np.float32) / 255.0, 0, 1)[..., None]
+
+        # tonalita' della fonte riallineata a quella del target, altrimenti i
+        # capelli incollati si leggono come un estraneo
+        sorgente = self._match_lab(sorgente, a[..., 0], out)
+        return np.clip(out.astype(np.float32) * (1 - a)
+                       + sorgente.astype(np.float32) * a, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _match_lab(img: np.ndarray, alpha: np.ndarray, reference: np.ndarray):
+        """Riporta i colori di `img` su quelli di `reference` dentro alpha."""
+        m = alpha > 0.35
+        if m.sum() < 80:
+            return img
+        lab_i = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lab_r = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB).astype(np.float32)
+        si, sr = lab_i[m], lab_r[m]
+        sc = (sr.std(axis=0) + 1e-6) / (si.std(axis=0) + 1e-6)
+        sc = np.clip(sc, 0.6, 1.6)
+        lab_i = (lab_i - si.mean(axis=0)) * sc + sr.mean(axis=0)
+        out = cv2.cvtColor(np.clip(lab_i, 0, 255).astype(np.uint8),
+                           cv2.COLOR_LAB2BGR)
+        return out
+
     def swap(self, frame: np.ndarray, src_entry: dict, target_face) -> np.ndarray:
         """Applica head swap o face swap a un volto target nel frame.
 
@@ -221,13 +286,15 @@ class HeadSwapper:
             self.fallbacks += 1
 
         # --- Maschera del volto interno ---
+        # Ellipse-first (robusta su pose laterali). Semantica solo come rinforzo leggero.
+        ellipse = inner_face_mask(frame.shape, kps, scale=1.15)
         if self.use_semantic:
-            face_mask_hard = semantic_face_mask(target_labels, kps, expand=4)
-            # Combina con ellisse leggera per coprire eventuali buchi
-            ellipse = inner_face_mask(frame.shape, kps, scale=1.12)
-            face_mask_hard = cv2.bitwise_or(face_mask_hard, ellipse)
+            sem = semantic_face_mask(target_labels, kps, expand=2)
+            # Usa la semantica solo dove coincide con l'ellisse (evita melting)
+            face_mask_hard = cv2.bitwise_or(ellipse, cv2.bitwise_and(sem, ellipse))
+            face_mask_hard = cv2.dilate(face_mask_hard, np.ones((3, 3), np.uint8), iterations=1)
         else:
-            face_mask_hard = inner_face_mask(frame.shape, kps, scale=1.18)
+            face_mask_hard = ellipse
 
         inner = feather(face_mask_hard, self.blend)
         neck = FaceParser.mask_for(target_labels, NECK_CLASSES)
@@ -299,15 +366,17 @@ class HeadSwapper:
         if self.use_poisson:
             try:
                 center = (int(kps[:, 0].mean()), int(kps[:, 1].mean()))
-                poisson_mask = cv2.erode(face_mask_hard, np.ones((3, 3), np.uint8), iterations=1)
+                # Maschera più stretta e peso più leggero → meno rischio di melting
+                poisson_mask = cv2.erode(face_mask_hard, np.ones((5, 5), np.uint8), iterations=1)
                 if poisson_mask.any() and poisson_mask.max() > 0:
                     blended = cv2.seamlessClone(
                         out, pre_swap, poisson_mask, center, cv2.MIXED_CLONE)
                     a = (feather(poisson_mask, max(5, self.blend // 2)).astype(np.float32)
                          / 255.0)[..., None]
+                    # Peso ridotto a 0.55 (prima 0.85) → più fedele a inswapper, meno artefatti
                     out = np.clip(
-                        blended.astype(np.float32) * (0.85 * a) +
-                        out.astype(np.float32) * (1.0 - 0.85 * a),
+                        blended.astype(np.float32) * (0.55 * a) +
+                        out.astype(np.float32) * (1.0 - 0.55 * a),
                         0, 255).astype(np.uint8)
             except Exception:
                 pass
