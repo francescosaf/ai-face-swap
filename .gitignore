@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Deep-Live-Cam: repository git separato, stock upstream hacksider/Deep-Live-Cam 2.1.6
+# Non versionato qui: contiene venv (1.9G) e modelli (1.5G) che GitHub rifiuta (>100MB/file).
+# Per ricostruirlo:
+#   git clone https://github.com/hacksider/Deep-Live-Cam.git dlfolder
+#   cd dlfolder && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+#   # poi scaricare i modelli vedi dlfolder/models/instructions.txt
+dlfolder/
+
+# Modelli AI: ri-scaricabili, superano il limite di 100MB per file
+*.onnx
+*.pth
+*.zip
+
+# Chiavi API
+apikey.txt
+*.apikey
+.env
+
+# Media e output: restano locali, non vengono caricati
+*.mp4
+*.mov
+*.jpeg
+*.jpg
+*.png
