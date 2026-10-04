@@ -15,19 +15,16 @@ dentro restava la fotografia. Misurato: rapporto d'area della testa fino a
 15.3x rispetto all'originale, e capelli che comparivano anche dove non c'era
 volto.
 
-Cosa fa invece (v3 — quality high/maximum)
------------------------------------------
-1. Maschera SEMANTICA (BiSeNet: skin+naso+occhi+bocca+labbra) invece
-   della sola ellisse dei 5 landmark → copertura precisa del naso.
+Cosa fa invece (v3.1 stabile)
+----------------------------
+1. Maschera ellipse-first + rinforzo semantico leggero (evita melting).
 2. `inswapper` rigenera il volto interno nella posa del target.
-3. Upscale selettivo della regione facciale (1.6x–2.0x) prima del
-   post-processing → più dettaglio senza upscalare tutto il video.
+3. Upscale selettivo moderato della regione facciale (1.25x–1.5x).
 4. Ricoloratura capelli/pelle in spazio LAB.
-5. Poisson blending (seamlessClone MIXED) con maschera semantica.
-6. Temporal smoothing REGIONALE: occhi/naso/bocca pesano solo il 40%
-   del valore globale → meno ghosting sui dettagli.
+5. Poisson blending leggero (peso 0.55) per integrare senza distorcere.
+6. Temporal smoothing REGIONALE: occhi/naso/bocca pesano solo il 40%.
 7. Il collo non viene mai toccato.
-Profili: --quality fast | high (default) | maximum
+Profili: --quality fast | high (default, stabile) | maximum
 
 
 Nessun modello generativo di testo e' coinvolto: gli ONNX disponibili per il
@@ -39,8 +36,11 @@ swap_config.json, per completezza.
 
 from __future__ import annotations
 
+import os
+
 import cv2
 import numpy as np
+from insightface.utils import face_align
 
 from face_parsing import (FACE_CLASSES, HAIR_CLASSES, HEAD_CLASSES,
                           NECK_CLASSES, SEMANTIC_FACE_CLASSES, HIGH_FREQ_CLASSES,
@@ -84,30 +84,38 @@ def sane_head_mask(labels: np.ndarray, face_box, kps) -> tuple[np.ndarray, bool]
     return landmark_head_mask(labels.shape[:2], kps), True
 
 
+_DEBUG = bool(os.environ.get("HEADSWAP_DEBUG"))
+
+
 class HeadSwapper:
     """Sostituzione della testa: volto da inswapper, capelli ricolorati."""
 
     # Profili di qualità predefiniti
     QUALITY = {
-        "fast":     {"blend": 9,  "temporal": 0.25, "face_scale": 1.0, "poisson": False, "semantic": False},
-        "high":     {"blend": 13, "temporal": 0.38, "face_scale": 1.6, "poisson": True,  "semantic": True},
-        "maximum":  {"blend": 15, "temporal": 0.42, "face_scale": 2.0, "poisson": True,  "semantic": True},
+        "fast":     {"blend": 9,  "temporal": 0.26, "face_scale": 1.00, "poisson": False, "semantic": False, "hair": True},
+        "high":     {"blend": 12, "temporal": 0.30, "face_scale": 1.25, "poisson": True,  "semantic": True,  "hair": True},
+        "maximum":  {"blend": 14, "temporal": 0.38, "face_scale": 1.5,  "poisson": True,  "semantic": True},
     }
 
     def __init__(self, models_dir, providers, swapper_fn, mode: str = "headswap",
-                 blend: int = 13, harmonize: float = 1.0, temporal: float = 0.38,
-                 face_scale: float = 1.6, use_poisson: bool = True,
-                 use_semantic: bool = True, quality: str | None = None):
-        if quality and quality in self.QUALITY:
-            q = self.QUALITY[quality]
-            blend = q["blend"]
-            temporal = q["temporal"]
-            face_scale = q["face_scale"]
-            use_poisson = q["poisson"]
-            use_semantic = q["semantic"]
+                 blend: int | None = None, harmonize: float = 1.0,
+                 temporal: float | None = None, face_scale: float | None = None,
+                 use_poisson: bool | None = None, use_semantic: bool | None = None,
+                 quality: str | None = None):
+        # I default sono None per distinguere "non passato" da "passato":
+        # il preset --quality fornisce i valori, ma un override esplicito
+        # della CLI deve poter vincere sul preset.
+        q = self.QUALITY.get(quality, {}) if quality else {}
+        blend = q.get("blend", 13) if blend is None else blend
+        temporal = q.get("temporal", 0.38) if temporal is None else temporal
+        face_scale = q.get("face_scale", 1.25) if face_scale is None else face_scale
+        use_poisson = q.get("poisson", True) if use_poisson is None else use_poisson
+        use_semantic = q.get("semantic", True) if use_semantic is None else use_semantic
+        q = q or {}
         self.mode = mode
         self.swapper_fn = swapper_fn
         self.blend = blend
+        self.hair_transfer = bool(q.get("hair", True))
         self.harmonize = harmonize
         self.temporal = temporal
         self.face_scale = max(1.0, min(face_scale, 2.5))  # clamp
@@ -129,6 +137,7 @@ class HeadSwapper:
             "img": src_img,
             "labels": labels,
             "box": box,
+            "hair_mask": self.parser.mask_for(labels, HAIR_CLASSES),
             "hair_stats": self._stats(src_img, labels, HAIR_CLASSES),
             "skin_stats": self._stats(src_img, labels, FACE_CLASSES),
             "kps": np.asarray(src_face.kps, np.float32),
@@ -199,6 +208,108 @@ class HeadSwapper:
         return np.clip(dst.astype(np.float32) * (1.0 - a) + new_bgr.astype(np.float32) * a,
                        0, 255).astype(np.uint8)
 
+    def _transfer_hair(self, out: np.ndarray, src_entry: dict, target_face) -> np.ndarray:
+        """Trasferisce la GEOMETRIA dei capelli dalla foto al target.
+
+        Il solo ricoloramento non basta per un head swap: i capelli restano
+        quelli del video e il risultato si legge come un face swap. Qui la
+        capigliatura della fonte viene allineata al volto del target e
+        incollata, ma solo dove BiSeNet dice che ci sono capelli, limitata
+        alla testa del target, escluso il volto (che gestisce inswapper) e
+        il collo. Il tono viene poi riallineato all'illuminazione del video,
+        altrisi sembrerebbe un collage.
+
+        Il trapianto e' voluto, ma circoscritto: la prima versione incollava
+        l'intera testa e l'area raggiungeva il 15.3x dell'originale.
+        """
+        src_img = src_entry.get("img")
+        if src_img is None:
+            return out
+
+        # M_* portano dal frame reale al template 112. Per passare dalla
+        # sorgente al target serve l'inverso di quella del target:
+        #   M_src @ p_src = M_tgt @ p_tgt  ->  p_tgt = inv(M_tgt) @ M_src @ p_src
+        # Invertire l'ordine (M_tgt @ inv(M_src)) espande invece di ridurre:
+        # i capelli si gonfiano di 2.7x invece di adattarsi al volto.
+        M_src = face_align.estimate_norm(np.asarray(src_entry["kps"], np.float32), 112)
+        M_tgt = face_align.estimate_norm(np.asarray(target_face.kps, np.float32), 112)
+        A = np.linalg.inv(np.vstack([M_tgt, [0, 0, 1]])) @ np.vstack([M_src, [0, 0, 1]])
+
+        h, w = out.shape[:2]
+        hair_src = src_entry.get("hair_mask")
+        if hair_src is None or not hair_src.any():
+            return out
+
+        capelli = cv2.warpAffine(hair_src, A[:2], (w, h), flags=cv2.INTER_LINEAR,
+                                 borderValue=0)
+        sorgente = cv2.warpAffine(src_img, A[:2], (w, h), borderValue=0)
+
+        # NON si intersecta con i capelli del target: quella maschera descrive
+        # la capigliatura gia' presente nel video e non potrebbe mai accogliere
+        # una pettinatura diversa. Il vincolo e' geometrico: ellisse generosa
+        # dai landmark, tagliata sotto il mento per non sporcare il collo.
+        # La regione si ricava dal bounding box del viso, non dai 5 landmark:
+        # landmark_head_mask usa nose-minus-occhio come base ed e' troppo
+        # stretta per contenere la capigliatura.
+        x1, y1, x2, y2 = target_face.bbox
+        fw, fh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+        regione = np.zeros(out.shape[:2], np.uint8)
+        cv2.ellipse(regione,
+                    (int((x1 + x2) / 2), int(y1 - 0.14 * fh)),
+                    (int(1.12 * fw), int(1.06 * fh)),
+                    0, 0, 360, 255, -1)
+        # niente collo: il taglio segue il mento
+        sotto = int(y1 + fh + 0.30 * fh)
+        if sotto < h:
+            regione[sotto:, :] = 0
+
+        # Il volto va escluso con un margine piu' ampio della maschera usata
+        # per il trapianto: i capelli che sfiorano gli occhi spostano i
+        # landmark e falsano la geometria (proporzioni 6.1%, 6.6 px di scarto)
+        kp = np.asarray(target_face.kps, np.float32)
+        escluso = cv2.dilate(inner_face_mask(out.shape, kp, scale=1.30),
+                             np.ones((7, 7), np.uint8), iterations=1)
+        alpha = cv2.bitwise_and(capelli, regione)
+        alpha = cv2.bitwise_and(alpha, cv2.bitwise_not(escluso))
+        if _DEBUG:
+            print(f"    [dbg] fonte={int((hair_src>0).sum())}px "
+                  f"allineati={int((capelli>0).sum())}px "
+                  f"regione={int((regione>0).sum())}px "
+                  f"finali={int((alpha>0).sum())}px")
+        if int((alpha > 0).sum()) < 120:
+            return out
+
+        # il bordo e' sfumato su due lati: dentro (dove incontra il volto
+        # generato) e fuori (dove incontra lo sfondo)
+        alpha = cv2.GaussianBlur(alpha, (0, 0), 3.0)
+        a = np.clip(alpha.astype(np.float32) / 255.0, 0, 1)[..., None]
+
+        # tonalita' della fonte riallineata a quella del target, altrimenti i
+        # capelli incollati si leggono come un estraneo
+        sorgente = self._match_lab(sorgente, a[..., 0], out)
+        if _DEBUG:
+            d = cv2.absdiff(out, sorgente).max(axis=2)
+            print(f"    [dbg] alpha px={int((a[...,0]>0.35).sum())} "
+                  f"cambiati>22: {int((d>22).sum())} media={d.mean():.2f}")
+        return np.clip(out.astype(np.float32) * (1 - a)
+                       + sorgente.astype(np.float32) * a, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _match_lab(img: np.ndarray, alpha: np.ndarray, reference: np.ndarray):
+        """Riporta i colori di `img` su quelli di `reference` dentro alpha."""
+        m = alpha > 0.35
+        if m.sum() < 80:
+            return img
+        lab_i = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lab_r = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB).astype(np.float32)
+        si, sr = lab_i[m], lab_r[m]
+        sc = (sr.std(axis=0) + 1e-6) / (si.std(axis=0) + 1e-6)
+        sc = np.clip(sc, 0.6, 1.6)
+        lab_i = (lab_i - si.mean(axis=0)) * sc + sr.mean(axis=0)
+        out = cv2.cvtColor(np.clip(lab_i, 0, 255).astype(np.uint8),
+                           cv2.COLOR_LAB2BGR)
+        return out
+
     def swap(self, frame: np.ndarray, src_entry: dict, target_face) -> np.ndarray:
         """Applica head swap o face swap a un volto target nel frame.
 
@@ -221,13 +332,17 @@ class HeadSwapper:
             self.fallbacks += 1
 
         # --- Maschera del volto interno ---
+        # Ellipse-first (robusta su pose laterali). Semantica solo come rinforzo leggero.
+        ellipse = inner_face_mask(frame.shape, kps, scale=1.15)
         if self.use_semantic:
-            face_mask_hard = semantic_face_mask(target_labels, kps, expand=4)
-            # Combina con ellisse leggera per coprire eventuali buchi
-            ellipse = inner_face_mask(frame.shape, kps, scale=1.12)
-            face_mask_hard = cv2.bitwise_or(face_mask_hard, ellipse)
+            sem = semantic_face_mask(target_labels, kps, expand=2)
+            # Solo dove la semantica conferma l'ellisse: allargarla e' la causa
+            # del melting, perche' il trapianto esce dai limiti del volto
+            face_mask_hard = cv2.bitwise_and(sem, ellipse)
+            if int(face_mask_hard.sum()) < 0.15 * int(ellipse.sum()):
+                face_mask_hard = ellipse
         else:
-            face_mask_hard = inner_face_mask(frame.shape, kps, scale=1.18)
+            face_mask_hard = ellipse
 
         inner = feather(face_mask_hard, self.blend)
         neck = FaceParser.mask_for(target_labels, NECK_CLASSES)
@@ -284,7 +399,11 @@ class HeadSwapper:
                 did_upscale = True
                 up_roi = up  # salvato per il reinserimento dopo
 
-        # --- 3. inswapper ---
+        # --- 3. capelli: geometria dalla foto, limitata alla testa del target ---
+        if self.hair_transfer:
+            out = self._transfer_hair(out, src_entry, target_face)
+
+        # --- 4. inswapper ---
         pre_swap = out.copy()
         out = self.swapper_fn(src_entry.get("_face"), target_face, out)
 
@@ -299,15 +418,17 @@ class HeadSwapper:
         if self.use_poisson:
             try:
                 center = (int(kps[:, 0].mean()), int(kps[:, 1].mean()))
-                poisson_mask = cv2.erode(face_mask_hard, np.ones((3, 3), np.uint8), iterations=1)
+                # Maschera più stretta e peso più leggero → meno rischio di melting
+                poisson_mask = cv2.erode(face_mask_hard, np.ones((5, 5), np.uint8), iterations=1)
                 if poisson_mask.any() and poisson_mask.max() > 0:
                     blended = cv2.seamlessClone(
                         out, pre_swap, poisson_mask, center, cv2.MIXED_CLONE)
                     a = (feather(poisson_mask, max(5, self.blend // 2)).astype(np.float32)
                          / 255.0)[..., None]
+                    # Peso ridotto a 0.55 (prima 0.85) → più fedele a inswapper, meno artefatti
                     out = np.clip(
-                        blended.astype(np.float32) * (0.85 * a) +
-                        out.astype(np.float32) * (1.0 - 0.85 * a),
+                        blended.astype(np.float32) * (0.55 * a) +
+                        out.astype(np.float32) * (1.0 - 0.55 * a),
                         0, 255).astype(np.uint8)
             except Exception:
                 pass
@@ -325,8 +446,6 @@ class HeadSwapper:
         il peso temporale è ridotto a ~40% del valore globale, per evitare
         ghosting e dettagli "trascinati". Sulle guance/fronte resta pieno.
         """
-        from insightface.utils import face_align
-
         key = id(src_entry.get("_face"))
         kps = np.asarray(target_face.kps, np.float32)
         prev = self._prev.get(key)

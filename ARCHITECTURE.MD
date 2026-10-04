@@ -163,3 +163,65 @@ dlfolder/
 
 I frame temporanei stanno in un `tempfile.mkdtemp()` e vengono rimossi alla
 fine, salvo `--keep-frames`.
+---
+
+## Trapianto dei capelli (head swap reale)
+
+Il ricoloramento dei capelli non rende un head swap. La capigliatura della
+foto viene allineata al volto del target e incollata.
+
+Ordine delle trasformazioni, in `head_swap.py`:
+
+1. `M_src` e `M_tgt` portano dal frame reale al template 112 di ArcFace
+2. `A = inv(M_tgt) @ M_src` mappa la sorgente sul target
+3. la maschera capelli e l'immagine sorgente vengono warpiate con `A`
+4. la regione di arrivo è un'ellisse derivata dal bounding box del viso,
+   tagliata sotto il mento
+5. il volto è escluso con margine (ellisse 1.30 + dilatazione 7×7): i capelli
+   che sfiorano gli occhi spostano i landmark
+6. il colore viene riallineato all'illuminazione del target in spazio LAB
+   (`_match_lab`), altrimenti il trapianto si legge come un collage
+7. l'alpha è sfumato 3.0 su due lati
+
+**L'ordine delle matrici è critico e va verificato, non supposto.**
+`M_src @ p_src = M_tgt @ p_tgt` implica `p_tgt = inv(M_tgt) @ M_src @ p_src`.
+Scrivendo `M_tgt @ inv(M_src)` si ottiene una scala di 1.92 invece di 0.515:
+i capelli si espandono di 2.7x invece di adattarsi al volto. Il sintomo
+(maschera grande, trapianto gonfio) è identico a quello della prima versione
+a foto statica, quindi la verifica va fatta sul determinante della
+trasformazione, non a occhio.
+
+La maschera dei capelli **non** va intersecata con quella del target: quella
+descrive la capigliatura già presente nel video. Intersecandole si perdeva il
+92% dei capelli (52855 px allineati → 4042 px utili).
+
+## Correzioni di plumbing
+
+- `--quality` sovrascriveva gli override espliciti di `--temporal`,
+  `--blend` e `--face-scale`, perché `__init__` riapplicava i valori del preset
+  dopo aver ricevuto i parametri. Il commento nel CLI diceva il contrario.
+  I default dei parametri sono ora `None`, così "non passato" si distingue da
+  "passato" e l'override vince sul preset.
+- `q` era referenziato fuori dal `if` che lo definiva: senza `--quality` il
+  modulo andava in `NameError` all'istanziazione.
+
+## Temporal e geometria
+
+Il peso del temporal ha un costo misurabile in allineamento, non solo in
+stabilità:
+
+| temporal | proporzioni bocca/occhi | spostamento landmark | flickering |
+|---|---|---|---|
+| 0.26 | 4.06% | 4.68 px | 0.073 |
+| 0.44 | 5.72% | 5.58 px | 0.077 |
+
+Lo smoothing temporale introduce ritardo e sposta i tratti. I preset sono
+tarati su `fast` 0.26, `high` 0.30, `maximum` 0.38.
+
+## Maschera semantica
+
+La maschera del volto è *ellipse-first*: la semantica di BiSeNet interseca
+l'ellisse invece di allargarla. La versione precedente faceva
+`or(ellisse, and(sem, ellisse))`, che è un'ellisse dilatata: allargare la
+maschera oltre i limiti del volto fa uscire il trapianto dal viso ed è la
+causa del melting.

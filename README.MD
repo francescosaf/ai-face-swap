@@ -288,3 +288,98 @@ sostituito con la foto di un'altra persona e segnala un falso fallimento. Non
 statiche incollate al centro e cambiate ogni 5 s. La zona centrale è immobile
 (MAD 0.153/255) mentre il bordo si muove (4.679/255), e l'output era troncato a
 360 frame su 409. Il face swap reale è quello prodotto da `headless_faceswap.py`.
+---
+
+## Verifica oggettiva: due strumenti nuovi
+
+Fin qui i difetti si guardavano a occhio, il che non scala e non dà
+numeri. Esistono ora due misure automatiche.
+
+### `diagnosi_difetti.py` — melting, warping, allineamento
+
+```bash
+./dlfolder/venv/bin/python diagnosi_difetti.py --originale VIDEO --output OUT.mp4
+```
+
+| difetto | firma misurata |
+|---|---|
+| face melting | varianza del Laplaciano nella regione del volto rispetto all'originale |
+| warped face | distanza inter-oculare e rapporto bocca/occhi sui landmark |
+| alignment failure | spostamento del baricentro dei landmark |
+| bordo visibile | eccesso di gradiente sul contorno rispetto all'originale |
+| flickering | deviazione standard dell'identità fra frame |
+
+Tre correzioni rese necessarie dai dati, non da supposizioni:
+
+- **Il bordo non era un difetto.** La prima versione confrontava il
+  gradiente con una soglia assoluta, ma il contorno del viso ha già
+  gradiente naturale (zigomi, mascella): misurava +30 e sembrava un difetto
+  grave. Misurando l'*eccesso* rispetto all'originale il valore reale è
+  +0.4, cioè nulla. Sarebbe stato un fix su un problema inesistente.
+- **Il warping era rumore.** Su un volto di 11 px la regressione dei landmark
+  dà scarti del 100-160%. La geometria ora si misura solo dove la distanza
+  inter-oculare supera i 25 px.
+- **Lo spostamento andrà misurato sui landmark, non sul bounding box.** In un
+  head swap il detector dimensiona il box anche sui capelli, quindi il suo
+  centro si sposta di 7-8 px *anche quando il volto è allineato*. Il
+  baricentro dei landmark si sposta di 2.3 px.
+
+### `verifica_headswap.py` — distingue head swap da face swap
+
+```bash
+./dlfolder/venv/bin/python verifica_headswap.py --originale VIDEO --output OUT.mp4
+```
+
+Misura quale percentuale di pixel è stata riscritta, regione per regione,
+usando le classi di BiSeNet. È la verifica che risponde alla domanda se il
+risultato è un head swap o un face swap: se i capelli non cambiano, è un face
+swap, per quanto bene rifinito sia il volto.
+
+## I capelli: perché il risultato era un face swap
+
+Il ricoloramento dei capelli non può produrre un head swap: i capelli
+restano quelli del video e si legge come un face swap. Ora la capigliatura
+della foto viene allineata al volto del target e incollata, limitata a una
+regione geometrica e tagliata sotto il mento, con i colori riallineati
+all'illuminazione del target.
+
+Un dettaglio che è costato una diagnosi: la maschera dei capelli della fonte
+**non** va intersecata con quella del target. La maschera del target descrive
+la capigliatura già presente nel video e non può mai accogliere una
+pettinatura diversa: intersecandole si perdeva il 92% dei capelli.
+
+## Risultati
+
+Video 720x1280, 24 fps, 409 frame, tre foto, `--map 0,1,2,0,0`.
+
+| | v3.1 high | test1 fast | test2 high | test3 maximum |
+|---|---|---|---|---|
+| dettagli del volto | 90% | 104% | 116% | 151% |
+| distanza inter-oculare | 3.69% | 3.69% | 3.64% | 3.88% |
+| proporzioni bocca/occhi | 2.60% | 3.31% | 2.59% | 3.07% |
+| spostamento landmark | 2.17 px | 2.21 px | 2.30 px | 2.81 px |
+| flickering | 0.120 | 0.039 | 0.054 | 0.058 |
+| **capelli riscritti** | 6.4% | **32.4%** | **33.4%** | **33.5%** |
+| esterno toccato | 0.1% | 0.7% | 0.7% | 0.7% |
+| tempo | 10.8 min | 9.1 min | 9.2 min | 9.4 min |
+
+Nessun difetto oltre soglia sui tre test. Il melting della v3 è risolto: i
+dettagli del volto sono ora *sopra* il 100%, non al 69% della v2. Il
+flicker è sceso da 0.120 a 0.039-0.058. Movimento, collo, sfondo e audio
+restano intatti (0.7% di pixel esterni toccati).
+
+`test2` (high) e `test3` (maximum) sono i migliori: `test3` ha il doppio
+ dei dettagli dell'originale, `test2` è il più fedele alla geometria.
+
+## Limiti noti
+
+- Il volto è un trapianto: identità e posa vengono dalla foto, ma la
+  micropittura della pelle resta quella di inswapper. Su un volto di 11 px
+  non c'è nulla da correggere e nulla da trapiantare.
+- `inswapper_128.onnx` è research / non-commerciale.
+- `simswap` e `hififace` non funzionano con l'ArcFace di Deep-Live-Cam:
+  richiedono recognizer dedicati. L'unico modello compatibile è inswapper.
+- La maschera semantica ora interseca l'ellisse invece di allargarla: allargare
+  la maschera oltre i limiti del volto è la causa del melting.
+- Le proporzioni si misurano solo sui frame in cui il volto supera i 25 px di
+  distanza inter-oculare: sotto quella soglia i landmark non sono affidabili.

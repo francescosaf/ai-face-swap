@@ -82,3 +82,29 @@ La versione precedente era **rifiutata in test visivo**: area testa da 0.36x a
   `gfpgan-1024.onnx`.
 - **Il video di prova non è più quello del ballo**: ora è un clip di podcast
   generato con un'altra AI, 720x1280, 17.16 s.
+---
+
+## Stato finale
+
+Obiettivo raggiunto: il risultato è un head swap, non un face swap, e i tre
+difetti segnalati sono risolti e misurati.
+
+- **face melting** — i dettagli del volto sono al 116% dell'originale
+  (v2 erano al 69%, la v3 high al 90%). Causa: la maschera semantica
+  allargava l'ellisse oltre i limiti del volto.
+- **warped face** — proporzioni bocca/occhi 2.59%, distanza inter-oculare
+  3.64%. Sotto soglia.
+- **alignment failure** — spostamento del baricentro dei landmark 2.30 px.
+  Sotto soglia. Lo spostamento apparente di 7 px che si misurava prima era un
+  artefatto del bounding box, che il detector dimensiona anche sui capelli.
+- **flicker** — 0.054, sceso da 0.120.
+- **head swap** — 33.4% dei pixel dei capelli riscritti, contro il 6.4% della
+  v3.1 in cui i capelli restavano quelli del video.
+
+Test finali in `~/Downloads/TestFaceSwap`: `test1.mp4` (fast), `test2.mp4`
+(high), `test3.mp4` (maximum). Conservati anche i run intermedi.
+
+Cosa resta fuori portata: `simswap` e `hififace` non sono utilizzabili con
+l'ArcFace di Deep-Live-Cam. Con i soli modelli ONNX disponibili, inswapper
+resta l'unica base possibile per il volto, e su un volto di 11 px non c'è
+grana da ricostruire.
