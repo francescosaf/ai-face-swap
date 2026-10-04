@@ -232,7 +232,7 @@ def report_source_similarity(sources) -> None:
     log("")
 
 
-def discover_identities(frame_paths, get_many_faces, sample_every: int):
+def discover_identities(frame_paths, get_many_faces, sample_every: int, force_k: int = 0):
     """Raggruppa le identita' distinte nel video, come fa la GUI di Deep-Live-Cam."""
     import cv2
     from modules.cluster_analysis import find_cluster_centroids
@@ -253,24 +253,37 @@ def discover_identities(frame_paths, get_many_faces, sample_every: int):
                 locations.append(fp.name)
     if not embs:
         return [], []
+    stack = np.vstack(embs)
     try:
-        centroids = find_cluster_centroids(embs)
+        if force_k > 1:
+            from sklearn.cluster import KMeans
+            centroids = KMeans(n_clusters=min(force_k, len(embs)),
+                               random_state=0, n_init=10).fit(stack).cluster_centers_
+        else:
+            centroids = find_cluster_centroids(embs)
     except Exception:
         return embs[:1], [locations[0]]
-    members = [c @ np.vstack(embs).T for c in centroids]
-    first_seen = []
-    for row in members:
-        first_seen.append(locations[int(np.argmax(row))])
+    first_seen = [locations[int(np.argmax(c @ stack.T))] for c in centroids]
     return list(centroids), first_seen
 
 
 def pick_assignment(n_ids: int, n_src: int, override: str | None):
-    if override:
-        parts = [int(x) for x in override.split(",")]
-        if sorted(parts) != list(range(n_src)):
-            raise RuntimeError(f"--map deve essere una permutazione di 0..{n_src-1}, got '{override}'")
-        return parts[:n_ids]
-    return [min(i, n_src - 1) for i in range(n_ids)]
+    """Restituisce, per ogni identita' del video, l'indice della foto da usare.
+
+    --map accetta una lista piu' corta delle fonti: con 3 identita' e 2 foto
+    utili, '--map 0,1,0' e' valido. Le identita' non elencate usano la foto
+    omonima, o l'ultima disponibile.
+    """
+    if not override:
+        return [min(i, n_src - 1) for i in range(n_ids)]
+    parts = [int(x) for x in override.split(",")]
+    bad = [p for p in parts if not 0 <= p < n_src]
+    if bad:
+        raise RuntimeError(
+            f"--map contiene indici fuori intervallo {bad}: le foto sono 0..{n_src-1}")
+    if len(parts) < n_ids:
+        parts += [parts[-1]] * (n_ids - len(parts))
+    return parts[:n_ids]
 
 
 def main() -> int:
@@ -283,7 +296,9 @@ def main() -> int:
     ap.add_argument("--output", type=Path, default=Path.home() / "Downloads" / "deep_ai.mp4")
     ap.add_argument("--provider", choices=["cuda", "coreml", "cpu"], help="forza il provider (default: auto)")
     ap.add_argument("--no-enhancer", action="store_true", help="disattiva GFPGAN (piu veloce, peggior qualita')")
-    ap.add_argument("--map", dest="mapping", help="permutazione identita'->foto, es. 0,2,1")
+    ap.add_argument("--map", dest="mapping", help="quale foto per identita': es. 0,1,0")
+    ap.add_argument("--identities", type=int, default=0,
+                    help="forza il numero di persone distinte nel video (default: automatico)")
     ap.add_argument("--det-size", type=int, default=640, choices=[160, 320, 640])
     ap.add_argument("--crf", type=int, default=17, help="qualita' H.264 (17=alta, 23=default)")
     ap.add_argument("--limit-frames", type=int, default=0, help="processa solo N frame (test)")
@@ -340,7 +355,7 @@ def main() -> int:
 
         frame_paths = sorted(frames_dir.glob("*.png"))
         sample = max(1, total // 120)
-        ids, first_seen = discover_identities(frame_paths, get_many_faces, sample)
+        ids, first_seen = discover_identities(frame_paths, get_many_faces, sample, args.identities)
         log(f"\n  Identita' distinte nel video: {len(ids)}")
         for i, fn in enumerate(first_seen):
             log(f"    identita' {i}: emersa intorno a {fn}")
