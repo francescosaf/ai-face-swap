@@ -1,0 +1,3 @@
+# macOS Intel (x86_64) — pin obbligatorio
+# `pip install onnxruntime` senza versione → ERROR: No matching distribution
+onnxruntime==1.23.2
