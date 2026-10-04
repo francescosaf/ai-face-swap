@@ -265,6 +265,9 @@ def main() -> int:
     ap.add_argument("--quality", choices=["fast", "high", "maximum"], default="high",
                     help="profilo qualità: fast | high (default) | maximum")
     ap.add_argument("--blend", type=int, default=None, help="sfumatura maschera (override quality)")
+    ap.add_argument("--hair-transfer", type=int, default=None,
+                    help="0 disattiva il trapianto geometrico dei capelli "
+                         "(override quality): evita l'effetto sticker/cutout")
     ap.add_argument("--harmonize", type=float, default=1.0,
                     help="0 disattiva l'armonizzazione del tono pelle (headswap)")
     ap.add_argument("--temporal", type=float, default=None,
@@ -335,8 +338,11 @@ def main() -> int:
             kw["temporal"] = args.temporal
         if args.face_scale is not None:
             kw["face_scale"] = args.face_scale
+        if args.hair_transfer is not None:
+            kw["hair"] = bool(args.hair_transfer)
         swapper = HeadSwapper(DL_DIR / "models", providers, M["swapper"].swap_face, **kw)
         q = HeadSwapper.QUALITY.get(args.quality, {})
+        log(f"[headswap] trapianto capelli = {swapper.hair_transfer}")
         log(f"[headswap] parser BiSeNet pronto  |  semantic={swapper.use_semantic}  "
             f"poisson={swapper.use_poisson}  face_scale={swapper.face_scale:.1f}x  "
             f"temporal={swapper.temporal:.2f}  blend={swapper.blend}")

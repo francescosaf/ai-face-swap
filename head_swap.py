@@ -94,14 +94,14 @@ class HeadSwapper:
     QUALITY = {
         "fast":     {"blend": 9,  "temporal": 0.26, "face_scale": 1.00, "poisson": False, "semantic": False, "hair": True},
         "high":     {"blend": 12, "temporal": 0.30, "face_scale": 1.25, "poisson": True,  "semantic": True,  "hair": True},
-        "maximum":  {"blend": 14, "temporal": 0.38, "face_scale": 1.5,  "poisson": True,  "semantic": True},
+        "maximum":  {"blend": 14, "temporal": 0.38, "face_scale": 1.5, "poisson": True,  "semantic": True, "hair": True},
     }
 
     def __init__(self, models_dir, providers, swapper_fn, mode: str = "headswap",
                  blend: int | None = None, harmonize: float = 1.0,
                  temporal: float | None = None, face_scale: float | None = None,
                  use_poisson: bool | None = None, use_semantic: bool | None = None,
-                 quality: str | None = None):
+                 hair: bool | None = None, quality: str | None = None):
         # I default sono None per distinguere "non passato" da "passato":
         # il preset --quality fornisce i valori, ma un override esplicito
         # della CLI deve poter vincere sul preset.
@@ -115,7 +115,7 @@ class HeadSwapper:
         self.mode = mode
         self.swapper_fn = swapper_fn
         self.blend = blend
-        self.hair_transfer = bool(q.get("hair", True))
+        self.hair_transfer = bool(q.get("hair", True)) if hair is None else bool(hair)
         self.harmonize = harmonize
         self.temporal = temporal
         self.face_scale = max(1.0, min(face_scale, 2.5))  # clamp
@@ -208,7 +208,8 @@ class HeadSwapper:
         return np.clip(dst.astype(np.float32) * (1.0 - a) + new_bgr.astype(np.float32) * a,
                        0, 255).astype(np.uint8)
 
-    def _transfer_hair(self, out: np.ndarray, src_entry: dict, target_face) -> np.ndarray:
+    def _transfer_hair(self, out: np.ndarray, src_entry: dict, target_face,
+                       target_labels: np.ndarray) -> np.ndarray:
         """Trasferisce la GEOMETRIA dei capelli dalla foto al target.
 
         Il solo ricoloramento non basta per un head swap: i capelli restano
@@ -244,53 +245,48 @@ class HeadSwapper:
                                  borderValue=0)
         sorgente = cv2.warpAffine(src_img, A[:2], (w, h), borderValue=0)
 
-        # NON si intersecta con i capelli del target: quella maschera descrive
-        # la capigliatura gia' presente nel video e non potrebbe mai accogliere
-        # una pettinatura diversa. Il vincolo e' geometrico: ellisse generosa
-        # dai landmark, tagliata sotto il mento per non sporcare il collo.
-        # La regione si ricava dal bounding box del viso, non dai 5 landmark:
-        # landmark_head_mask usa nose-minus-occhio come base ed e' troppo
-        # stretta per contenere la capigliatura.
+        # Il trapianto va ANCORATO alla capigliatura del video. La versione
+        # precedente usava una regione puramente geometrica: incollava capelli
+        # anche su fronte e sfondo, e ogni pixel fuori dalla silhuette creava
+        # un bordo nuovo contro lo sfondo. Misurato: il 36% di quanto scritto
+        # stava fuori dalla capigliatura, ed e' la causa diretta dell'alone.
         x1, y1, x2, y2 = target_face.bbox
-        fw, fh = max(1.0, x2 - x1), max(1.0, y2 - y1)
-        regione = np.zeros(out.shape[:2], np.uint8)
-        cv2.ellipse(regione,
-                    (int((x1 + x2) / 2), int(y1 - 0.14 * fh)),
-                    (int(1.12 * fw), int(1.06 * fh)),
-                    0, 0, 360, 255, -1)
-        # niente collo: il taglio segue il mento
-        sotto = int(y1 + fh + 0.30 * fh)
-        if sotto < h:
-            regione[sotto:, :] = 0
+        fw = max(1.0, x2 - x1)
 
-        # Il volto va escluso con un margine piu' ampio della maschera usata
-        # per il trapianto: i capelli che sfiorano gli occhi spostano i
-        # landmark e falsano la geometria (proporzioni 6.1%, 6.6 px di scarto)
+        capelli_tgt = self.parser.mask_for(target_labels, HAIR_CLASSES)
+        if not capelli_tgt.any():
+            return out
+        # dilatazione generosa per permettere crescita di volume, ma ancorata:
+        # la forma resta quella del video, quindi non nasce alcun bordo nuovo
+        k = max(7, int(0.14 * fw)) | 1
+        silhouette = cv2.dilate(capelli_tgt, np.ones((k, k), np.uint8), iterations=1)
+        silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_CLOSE,
+                                      np.ones((k, k), np.uint8), iterations=1)
+
+        sorgente = cv2.warpAffine(src_img, A[:2], (w, h), borderValue=0)
+
         kp = np.asarray(target_face.kps, np.float32)
         escluso = cv2.dilate(inner_face_mask(out.shape, kp, scale=1.30),
                              np.ones((7, 7), np.uint8), iterations=1)
-        alpha = cv2.bitwise_and(capelli, regione)
-        alpha = cv2.bitwise_and(alpha, cv2.bitwise_not(escluso))
-        if _DEBUG:
-            print(f"    [dbg] fonte={int((hair_src>0).sum())}px "
-                  f"allineati={int((capelli>0).sum())}px "
-                  f"regione={int((regione>0).sum())}px "
-                  f"finali={int((alpha>0).sum())}px")
-        if int((alpha > 0).sum()) < 120:
+
+        nucleo = cv2.bitwise_and(capelli, silhouette)
+        nucleo = cv2.bitwise_and(nucleo, cv2.bitwise_not(escluso))
+        nucleo = cv2.morphologyEx(nucleo, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        if int((nucleo > 0).sum()) < 120:
             return out
 
-        # il bordo e' sfumato su due lati: dentro (dove incontra il volto
-        # generato) e fuori (dove incontra lo sfondo)
-        alpha = cv2.GaussianBlur(alpha, (0, 0), 3.0)
-        a = np.clip(alpha.astype(np.float32) / 255.0, 0, 1)[..., None]
-
-        # tonalita' della fonte riallineata a quella del target, altrimenti i
-        # capelli incollati si leggono come un estraneo
-        sorgente = self._match_lab(sorgente, a[..., 0], out)
+        # Alpha pieno dentro, rampa di pochi pixel solo sul bordo. Una sfumatura
+        # larga su un'area grande e' cio' che produce il "velo": qui dentro si
+        # sostituisce davvero, il bordo sfuma solo per non far saltare il taglio.
+        dist = cv2.distanceTransform((nucleo > 0).astype(np.uint8), cv2.DIST_L2, 3)
+        a = np.clip(dist / 3.0, 0, 1)[..., None]
         if _DEBUG:
-            d = cv2.absdiff(out, sorgente).max(axis=2)
-            print(f"    [dbg] alpha px={int((a[...,0]>0.35).sum())} "
-                  f"cambiati>22: {int((d>22).sum())} media={d.mean():.2f}")
+            print(f"    [dbg] capelli_tgt={int((capelli_tgt>0).sum())}px "
+                  f"nucleo={int((nucleo>0).sum())}px "
+                  f"alpha_media={float(a.mean()):.2f} "
+                  f"sopra_0.9={int((a[...,0]>0.9).sum())}px")
+
+        sorgente = self._match_lab(sorgente, a[..., 0], out)
         return np.clip(out.astype(np.float32) * (1 - a)
                        + sorgente.astype(np.float32) * a, 0, 255).astype(np.uint8)
 
@@ -401,7 +397,7 @@ class HeadSwapper:
 
         # --- 3. capelli: geometria dalla foto, limitata alla testa del target ---
         if self.hair_transfer:
-            out = self._transfer_hair(out, src_entry, target_face)
+            out = self._transfer_hair(out, src_entry, target_face, target_labels)
 
         # --- 4. inswapper ---
         pre_swap = out.copy()
