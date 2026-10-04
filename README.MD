@@ -1,147 +1,187 @@
-# AI Face Swap — Video Deepfake Pipeline
+# AI Face Swap — video head-swap locale
 
-Pipeline **locale** (senza API a pagamento) per sostituire i volti in un video,
-usando **3 foto di riferimento** come sorgenti dei volti e un video di
-riferimento come bersaglio. L'obiettivo è riprodurre in locale quello che
-fanno servizi come Magic Hour, Remaker AI e Kling AI, usando solo codice
-open-source: **Deep-Live-Cam** (ex Roop) + **InsightFace** + modelli **ONNX**.
+Sostituisce volti (e capelli) in un video a partire da **N foto**, in locale
+su macOS/Linux oppure su **Colab/Kaggle**, senza API a pagamento.
 
-> **Repository privato.** Contiene riferimenti a un video e a 3 foto di persone
-> identificabili. Nessun media viene versionato (vedi `.gitignore`).
+Stack: **Deep-Live-Cam** (ex Roop) + **InsightFace** + modelli **ONNX**.
+Nessun modello generativo di testo: vedi [Prompt](#prompt).
+
+> **Repository privato.** I media di prova raffigurano persone identificabili e
+> non vengono versionati (vedi `.gitignore`). `inswapper_128` è rilasciato per
+> ricerca non commerciale: verifica la licenza prima di qualsiasi uso.
 
 ---
 
-## Input
+## Modalità
 
-| Tipo | Percorso | Note |
+| Modalità | Cosa sostituisce | Modelli |
 |---|---|---|
-| Video di riferimento | `~/Downloads/Comment PROMPT...Latent.mp4` | 9:16, 17.16 s |
-| Foto 1 | `~/Downloads/foto1.jpeg` | 679x1024 |
-| Foto 2 | `~/Downloads/foto2.jpeg` | 1536x2048 |
-| Foto 3 | `~/Downloads/foto3.jpeg` | 685x1024 |
-| Chiave API Magic Hour | `~/apikey.txt` | opzionale, solo per `magic_hour_call.py` |
+| `headswap` **(predefinita)** | volto, capelli, orecchie, cappello | BiSeNet + inswapper |
+| `faceswap` | solo il volto interno | inswapper |
 
-I media stanno **fuori** dal repository e non vengono caricati su GitHub.
+`inswapper` da solo lavora **dentro l'ellisse dei 5 landmark**: i capelli e le
+orecchie restano quelli del video. Per un head swap serve segmentare la testa,
+e questo fa BiSeNet (19 classi).
 
-## Output
+## Risultati misurati
 
-| File | Stato | Descrizione |
-|---|---|---|
-| `final_result_3subjects.mp4` | ✅ esiste | **NON è un face swap.** Video sorgente con le 3 foto statiche incollate al centro, cambiate ogni 5 s |
-| `deep_ai.mp4` | ❌ mai prodotto | L'output atteso dal face swap reale |
+Video di prova 720x1280, 24 fps, 409 frame, 17.04 s, macOS Intel (CoreML).
 
-## Stato reale del progetto
+| Modalità | Identità residua | Zona volto | Fuori volto | Durata | Audio |
+|---|---|---|---|---|---|
+| originale | 0.961 | — | — | 17.16 s | sì |
+| `faceswap` | **0.373** | 5.05 | 1.72 | 17.04 s | AAC 2ch |
+| `headswap` | **0.214** | 30.21 | 1.80 | 17.04 s | AAC 2ch |
 
-Il face-swap AI **non è mai stato eseguito**. La pipeline contiene due parti
-scritte ma solo una usata, e quella usata non fa face swap.
+*Identità residua* = `1 - coseno(embedding(volto in output), embedding(foto))`.
+Valore alto (~0.9) = il volto è ancora quello originale, nessuno swap.
+Valore basso (~0.2) = il volto è stato sostituito.
 
-### Cosa produce output oggi
+`headswap` vince perché trasferisce anche capelli e pelle della fonte, quindi
+l'identità risultante è più coerente di un volto innestato nel capello altrui.
+Entrambe lasciano lo sfondo intatto (≤ 1.80/255) e preservano durata e audio.
 
-`generate_final.py` legge i frame con OpenCV e assegna direttamente un
-rettangolo di pixel:
-
-```python
-frame[y:y + h, x:x + w] = img   # generate_final.py:36
-```
-
-Nessun detector, nessun tracking, nessuna inferenza. Risultato: uno slideshow
-di 3 foto statiche sopra il video originale.
-
-Verifica: la differenza media tra due frame nella regione centrale (dove sta la
-foto) è `0.153/255`, contro `4.679/255` nella regione di bordo dove il video
-si muove normalmente. `0.15` è rumore di compressione H.264, non movimento.
-
-### Cosa manca
-
-1. **Nessun driver headless.** Deep-Live-Cam è pensato per la GUI Tkinter:
-   ogni funzione di `modules/core.py` chiama `update_status()`. Va scritto un
-   loop che usi direttamente `face_swapper.get_face_swapper()` e
-   `face_enhancer.process_frame_v2()`.
-2. **Nessuna mappatura multi-sorgente.** Deep-Live-Cam accetta una sola
-   faccia sorgente. Serve codice esplicito per associare i 3 volti del video ai
-   3 riferimenti.
-3. **`gfpgan-1024.onnx` mancante.** È il modello che `face_enhancer.py` richiede
-   (`MODEL_FILE = "gfpgan-1024.onnx"`). Il `GFPGANv1.4.pth` presente è un
-   checkpoint PyTorch, inutilizzabile: torch non è installato e il codice è
-   ONNX-only.
-4. **`buffalo_l` scaricato in un percorso doppio** (`dlfolder/models/models/`),
-   perché il codice passa `root='models'` e InsightFace aggiunge `models/`.
-
-### Modelli verificati funzionanti
-
-Test reali su macOS Intel (`x86_64`), venv Python 3.12.14,
-onnxruntime 1.23.0, insightface 0.7.3:
-
-| Provider | Init | Per-frame |
-|---|---|---|
-| CoreML | 17.1 s | **0.80 s** |
-| CPU | 3.2 s | 1.39 s |
-
-`inswapper_128.onnx` carica ed esegue correttamente. CoreML accelera 186 nodi su
-226. Stima: 360 frame x 0.8 s ≈ **5 minuti** per un volto; 20-40 minuti con 3
-soggetti e GFPGAN attivo. Lento ma fattibile.
-
-### Bug noti
-
-- `generate_final.py:18` — `cv2.resize` non preserva il rapporto aspettale:
-  foto2 è 3:4 e viene schiacciata in 9:16, risultando deformata.
-- `generate_final.py` — l'output è 15.00 s contro 17.16 s del sorgente:
-  **2.16 s tagliati in silenzio**.
-- `generate_final.py` — `cv2.imread` senza controllo su `None`: un percorso
-  sbagliato produce `cv2.resize(None)` → crash.
-- `faceswap_pipeline.py:48-49` — chiamate principali commentate;
-  `swap_faces()` è un `shutil.copy`. Non è mai stato eseguito.
-- `face_swap.py` — la via locale invoca `roop` (repository rinominato in
-  Deep-Live-Cam, quel path non è più valido); le vie cloud fanno
-  `raise NotImplementedError`. Codice morto.
-- `magic_hour_call.py` — `SOURCE_IMG` non è definito → `NameError` all'esecuzione.
-
-## Struttura del repository
-
-```
-AI face swap/
-├── .gitignore
-├── README.MD              # questo file
-├── ARCHITECTURE.MD        # piano architetturale (non descrive il codice eseguito)
-├── GOAL.MD                # obiettivo e note di stato
-├── face_swap.py           # scaffolding multi-opzione — non funzionante
-├── faceswap_pipeline.py   # pipeline placeholder — non eseguita
-├── generate_final.py      # UNICO script eseguito: overlay OpenCV, non AI
-└── magic_hour_call.py     # client API Magic Hour — non funzionante
-```
-
-`dlfolder/` è escluso: è un clone intatto di `hacksider/Deep-Live-Cam` 2.1.6
-(commit `759e3f9`) **senza modifiche locali**, con dentro venv (1.9 GB) e modelli
-(1.5 GB). GitHub rifiuta file oltre 100 MB, quindi committarlo bloccherebbe il
-push. Per ricostruirlo:
+## Installazione
 
 ```bash
 git clone https://github.com/hacksider/Deep-Live-Cam.git dlfolder
-cd dlfolder && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
-# modelli: vedi dlfolder/models/instructions.txt
+python3 -m venv dlfolder/venv
+./dlfolder/venv/bin/pip install -r dlfolder/requirements.txt
 ```
 
-## Requisiti
+Il repository è **privato** e contiene gli script, non `dlfolder/`, che resta
+escluso perché contiene venv e modelli oltre 100 MB.
 
-- macOS Intel (`x86_64`) o Apple Silicon
-- `ffmpeg` — su Intel: build statico da evermeet.cx (`brew` richiede
-  Command Line Tools)
-- Python 3.10+
-- `onnxruntime`, `insightface`, `opencv-python` (nel venv di `dlfolder`)
+Al primo avvio vengono scaricati da soli:
 
-## Note legali
+- `inswapper_128.onnx` (554 MB), `gfpgan-1024.onnx` (se serve)
+- `bisenet_resnet18.onnx` (51 MB, MIT, per l'head swap)
+- `buffalo_l` di InsightFace, nella cache utente
 
-- **`inswapper_128.onnx` è non-commercial, research use only** (InsightFace).
-  Nessun uso commerciale senza licenza.
-- Sostituire il volto di una persona reale e identificabile senza il suo consenso
-  viola i diritti di immagine. Dal 2 agosto 2026 l'art. 50(4) dell'AI Act impone
-  di dichiarare i deepfake in modo evidente all'utente.
-- Per pubblicazione usare soggetti che abbiano autorizzato la sostituzione.
+##Uso
 
-## Documentazione correlata
+### Locale
 
-- `ARCHITECTURE.MD` — il piano originale. **Non corrisponde al codice eseguito**:
-  descrive un output `deep_ai.mp4` via Deep-Live-Cam e una timeline a intervalli
-  che lo script non implementa (usa terzi uguali).
-- `GOAL.MD` — obiettivo originale e problemi incontrati. Contiene alcuni stati
-  superati (ad esempio `buffalo_l`, che ora è scaricato).
+```bash
+PY=./dlfolder/venv/bin/python
+
+# 1. censimento: quante persone sono nel video, con provini
+$PY video_face_roster.py --video clip.mp4 --out ./censimento \
+    --photo foto1.jpg foto2.jpg
+
+# 2. sostituzione, leggendo tutto dal config
+$PY headless_faceswap.py --config ./censimento/swap_config.json \
+    --output ./risultato.mp4
+
+# oppure tutto in una riga
+$PY headless_faceswap.py --video clip.mp4 --photo foto1.jpg foto2.jpg \
+    --mode headswap --output ./risultato.mp4
+```
+
+### Colab
+
+`TestFaceSwap.ipynb` contiene le stesse chiamate: le celle eseguono gli script
+con `subprocess`, quindi non c'è logica duplicata e il notebook non può
+diventare obsoleto rispetto alla CLI.
+
+### Opzioni utili
+
+| Flag | Effetto |
+|---|---|
+| `--mode headswap\|faceswap` | predefinita `headswap` |
+| `--map 0,1,0` | fissa quale foto per ogni persona (indice foto) |
+| `--identities N` | forza il numero di persone distinte nel video |
+| `--prompt "..."` | registra il prompt nel config (vedi sotto) |
+| `--no-enhancer` | salta GFPGAN, più veloce |
+| `--provider cuda\|coreml\|cpu` | forza il provider ONNX |
+| `--limit-frames N` | prova rapida sui primi N frame |
+| `--save-masks DIR` | salva maschere e viste di debug |
+
+## Come viene scelto chi è chi
+
+**Non è possibile sapere automaticamente a chi appartiene il soggetto delle
+tue foto.** L'abbinamento automatico è per frequenza di comparse nel video.
+
+Il confronto fra una foto e un volto del video dà distanze embeddings molto
+alte (0.90+): non è un errore, significa che sono persone diverse. Quindi:
+
+1. `video_face_roster.py` raggruppa i volti del video e produce un provino
+   (`persona_N_provino.png`) per ogni persona.
+2. Tu riconosci le persone e o editi `swap_config.json`, oppure passi `--map`.
+
+Su un video a due persone il risultato è 4 identità, con le due dominanti a 43
+e 24 apparizioni: le altre sono frammenti dello stesso soggetto in pose diverse.
+
+### Raggruppamento
+
+Il clustering non usa una soglia fissa, che su questo video dava risultati
+diversi a ogni prova:
+
+1. le embedding vengono **medie su tracciati temporali** (i volti sono
+   collegati fra frame consecutivi per IoU del bounding box);
+2. la gerarchia agglomerativa viene tagliata con il **metodo di Otsu**, che
+   massimizza la varianza fra le due classi e trova la valle fra "stessa
+   persona" e "persone diverse".
+
+Su questo video: 79 identità con una soglia greedy a 0.55, 26 con Otsu sulle
+embedding grezze, **4** con le embedding mediate sui tracciati.
+
+## Verifica
+
+Non dare per scontato che sia riuscito. Un risultato può sembrare plausibile
+ed essere una sovrapposizione statica, o un'immagine distrutta.
+
+```bash
+$PY verifica_swap.py --videoorig clip.mp4 --videoswap risultato.mp4 \
+    --rif foto1.jpg --modalita headswap
+```
+
+Esce con codice diverso da zero se il volto non è stato sostituito, se lo
+sfondo è stato toccato o se la zona del volto è distorta.
+
+**Confronto tra video già codificati: attenzione ai numeri falsi.** Con x264 i
+blocchi vicini a una zona molto cambiata vengono riquantizzati diversamente: una
+differenza media di 32/255 su una fascia sottile può essere solo codice. Per
+questo `verifica_swap.py` usa come metrica primaria la distanza di identità,
+che non dipende dal codec.
+
+## Prompt
+
+I modelli ONNX usati — `inswapper`, GFPGAN, BiSeNet — **non accettano prompt di
+testo**. Un prompt per head swap ("sostituisci il volto e i capelli…")
+descriverebbe un setup diverso: diffusione con ControlNet/IP-Adapter.
+
+Il prompt viene comunque registrato in `swap_config.json` con il flag
+`"prompt_is_used_by_model": false`, come documentazione di riferimento.
+
+## Come funziona l'head swap
+
+1. `inswapper` sostituisce il volto interno, prendendo l'identità dalla foto.
+2. BiSeNet segmenta foto e video in 19 classi, separando capelli, orecchie e
+   cappello da collo e abbigliamento.
+3. La testa della foto viene warpiata sulla geometria del target tramite
+   similar-transform dei 5 landmark.
+4. Il bordo viene sfumato; **il collo è protetto** e lo sfondo non viene
+   toccato.
+
+Il colore della pelle viene allineato all'illuminazione del target, ma **solo
+sui pixel della testa di riferimento**: applicarlo all'intero frame sporcherebbe
+il video (in una versione intermedia sporcava il fondo di 53/255).
+
+## Limiti noti
+
+- Le embedding di uno stesso volto variano fino a ~0.56 fra frame consecutivi
+  (posa, espressione, motion blur, compressione): da qui la necessità di
+  mediare sui tracciati.
+- I frame vengono estratti come PNG su disco, quindi un video molto lungo
+  occupa spazio. Conviene lavorarci in segmenti.
+- Se nel video un volto è troppo piccolo, di profilo o coperto, non viene
+  sostituito. Lo script esce con codice 3 se non ha sostituito nessun volto,
+  invece di produrre un video identico all'originale.
+
+## Note di audit
+
+`final_result_3subjects.mp4` non è un face swap: è il video sorgente con 3 foto
+statiche incollate al centro e cambiate ogni 5 s. La zona centrale è immobile
+(MAD 0.153/255) mentre il bordo si muove (4.679/255), e l'output era troncato a
+360 frame su 409. Il face swap reale è quello prodotto da `headless_faceswap.py`.
