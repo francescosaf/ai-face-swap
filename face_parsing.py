@@ -28,10 +28,14 @@ CLASS_NAMES = {
 }
 
 FACE_CLASSES = {1, 2, 3, 4, 5, 10, 11, 12, 13}
+# Classi che formano il volto "interno" da sostituire (no orecchie, no capelli)
+SEMANTIC_FACE_CLASSES = {1, 2, 3, 4, 5, 10, 11, 12, 13}  # skin, brows, eyes, nose, mouth, lips
 HEAD_CLASSES = {1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 17, 18}
 HAIR_CLASSES = {17, 18}
 NECK_CLASSES = {14, 15}
 EXCLUDE_FROM_HEAD = {0, 14, 15, 16}
+# Classi ad alta frequenza (meno temporal smoothing)
+HIGH_FREQ_CLASSES = {4, 5, 10, 11, 12, 13}  # eyes, nose, mouth, lips
 
 _MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 _STD = np.array([0.229, 0.224, 0.225], np.float32)
@@ -108,15 +112,28 @@ class FaceParser:
         return feather(mask, radius)
 
 
-def inner_face_mask(img_shape, kps, scale: float = 1.0) -> np.ndarray:
-    """Ellisse dei 5 landmark: la regione che inswapper sostituisce davvero."""
+def inner_face_mask(img_shape, kps, scale: float = 1.15) -> np.ndarray:
+    """Maschera del volto interno (ellisse + copertura extra naso/mento).
+
+    Inswapper opera dentro l'ellisse dei 5 landmark. Qui la allarghiamo
+    leggermente (scale default 1.15) e spostiamo il centro verso il basso
+    per coprire meglio naso e parte superiore del mento, riducendo i
+    glitch tipici sul naso al confine della maschera.
+    """
     mask = np.zeros(img_shape[:2], np.uint8)
     pts = np.asarray(kps, np.float32)
-    centre = pts[:4].mean(axis=0)
+    if pts.shape[0] < 5:
+        return mask
+    # media occhi + naso per un centro più stabile
+    centre = pts[[0, 1, 2, 3, 4]].mean(axis=0)
+    # sposta leggermente verso il basso per includere meglio il naso
+    centre[1] += abs(pts[2][1] - pts[0][1]) * 0.08
     span = pts[2] - pts[0]
+    ax = max(6.0, abs(float(span[0])) * scale)
+    ay = max(6.0, abs(float(span[1])) * scale * 1.12)  # un po' più alto
+    angle = float(np.degrees(np.arctan2(span[1], span[0])))
     cv2.ellipse(mask, (int(centre[0]), int(centre[1])),
-                (int(abs(span[0]) * scale), int(abs(span[1]) * scale)),
-                float(np.degrees(np.arctan2(span[1], span[0]))), 0, 360, 255, -1)
+                (int(ax), int(ay)), angle, 0, 360, 255, -1)
     return mask
 
 
@@ -141,3 +158,27 @@ def landmark_head_mask(img_shape, kps, grow_x: float = 0.55,
     cv2.ellipse(mask, (int(centre[0]), int(cy)), (int(ax), int(ay)),
                 0, 0, 360, 255, -1)
     return mask
+
+
+def semantic_face_mask(labels: np.ndarray, kps=None, expand: int = 3) -> np.ndarray:
+    """Maschera semantica del volto interno (skin+naso+occhi+bocca+labbra).
+
+    Molto più precisa dell'ellisse dei 5 landmark, specialmente sul naso e
+    sulla mandibola. Se BiSeNet fallisce (maschera troppo piccola), si
+    ripiega sull'ellisse allargata.
+    """
+    mask = FaceParser.mask_for(labels, SEMANTIC_FACE_CLASSES)
+    area = int((mask > 0).sum())
+    if area < 80 and kps is not None:
+        # fallback sull'ellisse
+        return inner_face_mask(labels.shape[:2], kps, scale=1.2)
+    if expand > 0 and area > 0:
+        k = expand * 2 + 1
+        mask = cv2.dilate(mask, np.ones((k, k), np.uint8), iterations=1)
+    return mask
+
+
+def high_freq_mask(labels: np.ndarray) -> np.ndarray:
+    """Maschera delle zone ad alta frequenza (occhi, naso, bocca).
+    Usata per ridurre il temporal smoothing su queste zone."""
+    return FaceParser.mask_for(labels, HIGH_FREQ_CLASSES)

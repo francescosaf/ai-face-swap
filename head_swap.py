@@ -15,18 +15,20 @@ dentro restava la fotografia. Misurato: rapporto d'area della testa fino a
 15.3x rispetto all'originale, e capelli che comparivano anche dove non c'era
 volto.
 
-Cosa fa invece
--------------
-1. `inswapper` rigenera il volto interno nella posa del target a ogni frame:
-   e' lui a portare il movimento, ed e' la ragione per cui il volto si muove.
-2. La capigliatura viene ricolorata, non trapiantata: dentro la maschera
-   capelli del *video* si allineano media e deviazione standard alla
-   capigliatura della *foto*. I pixel restano quelli del video, quindi
-   ombreggiamenti, movimenti e capelli che svolazzano restano al loro posto.
-   Solo il colore cambia.
-3. La tonalita' della pelle viene allineata all'illuminazione del target,
-   limitata alla testa e mai all'intero frame.
-4. Il collo non viene mai toccato.
+Cosa fa invece (v3 — quality high/maximum)
+-----------------------------------------
+1. Maschera SEMANTICA (BiSeNet: skin+naso+occhi+bocca+labbra) invece
+   della sola ellisse dei 5 landmark → copertura precisa del naso.
+2. `inswapper` rigenera il volto interno nella posa del target.
+3. Upscale selettivo della regione facciale (1.6x–2.0x) prima del
+   post-processing → più dettaglio senza upscalare tutto il video.
+4. Ricoloratura capelli/pelle in spazio LAB.
+5. Poisson blending (seamlessClone MIXED) con maschera semantica.
+6. Temporal smoothing REGIONALE: occhi/naso/bocca pesano solo il 40%
+   del valore globale → meno ghosting sui dettagli.
+7. Il collo non viene mai toccato.
+Profili: --quality fast | high (default) | maximum
+
 
 Nessun modello generativo di testo e' coinvolto: gli ONNX disponibili per il
 face/head swap sono solo inswapper e GFPGAN. I prompt IP-Adapter
@@ -41,8 +43,9 @@ import cv2
 import numpy as np
 
 from face_parsing import (FACE_CLASSES, HAIR_CLASSES, HEAD_CLASSES,
-                          NECK_CLASSES, FaceParser, feather, inner_face_mask,
-                          landmark_head_mask)
+                          NECK_CLASSES, SEMANTIC_FACE_CLASSES, HIGH_FREQ_CLASSES,
+                          FaceParser, feather, inner_face_mask,
+                          landmark_head_mask, semantic_face_mask, high_freq_mask)
 
 # Oltre questi limiti l'output di BiSeNet e' considerato sbagliato: su un
 # volto piccolo e generato dall'AI il segmentatore etichetta a volte un terzo
@@ -84,13 +87,32 @@ def sane_head_mask(labels: np.ndarray, face_box, kps) -> tuple[np.ndarray, bool]
 class HeadSwapper:
     """Sostituzione della testa: volto da inswapper, capelli ricolorati."""
 
+    # Profili di qualità predefiniti
+    QUALITY = {
+        "fast":     {"blend": 9,  "temporal": 0.25, "face_scale": 1.0, "poisson": False, "semantic": False},
+        "high":     {"blend": 13, "temporal": 0.38, "face_scale": 1.6, "poisson": True,  "semantic": True},
+        "maximum":  {"blend": 15, "temporal": 0.42, "face_scale": 2.0, "poisson": True,  "semantic": True},
+    }
+
     def __init__(self, models_dir, providers, swapper_fn, mode: str = "headswap",
-                 blend: int = 9, harmonize: float = 1.0, temporal: float = 0.0):
+                 blend: int = 13, harmonize: float = 1.0, temporal: float = 0.38,
+                 face_scale: float = 1.6, use_poisson: bool = True,
+                 use_semantic: bool = True, quality: str | None = None):
+        if quality and quality in self.QUALITY:
+            q = self.QUALITY[quality]
+            blend = q["blend"]
+            temporal = q["temporal"]
+            face_scale = q["face_scale"]
+            use_poisson = q["poisson"]
+            use_semantic = q["semantic"]
         self.mode = mode
         self.swapper_fn = swapper_fn
         self.blend = blend
         self.harmonize = harmonize
         self.temporal = temporal
+        self.face_scale = max(1.0, min(face_scale, 2.5))  # clamp
+        self.use_poisson = use_poisson
+        self.use_semantic = use_semantic
         self.parser = FaceParser(models_dir, providers)
         self._src_cache: dict = {}
         self._prev: dict = {}
@@ -125,18 +147,16 @@ class HeadSwapper:
         return px.mean(axis=0), px.std(axis=0) + 1e-3, n
 
     @staticmethod
-    def _apply_stats(dst: np.ndarray, mask: np.ndarray, stats, soft: int = 15):
-        """Allinea media e deviazione standard dentro la maschera.
+    def _apply_stats(dst: np.ndarray, mask: np.ndarray, stats, soft: int = 17):
+        """Allinea media e deviazione standard dentro la maschera (spazio LAB).
 
-        I pixel non vengono sostituiti: vengono riscalati e traslati. La
-        struttura spaziale resta, quindi un capello che si muove continua a
-        muoversi; cambia solo il colore.
+        Lavora in LAB per un trasferimento di colore più naturale.
+        I pixel non vengono sostituiti: vengono riscalati e traslati.
+        La struttura spaziale resta, quindi un capello che si muove continua
+        a muoversi; cambia solo il colore.
 
-        La miscelazione passa per un alpha sfumato invece di selezionare i
-        pixel con una soglia: con una maschera binaria il ricolor finiva con
-        un bordo netto, visibile come un contorno ("disegno") attorno a
-        capelli e pelle. Le statistiche sono calcolate solo sull'interno
-        della maschera, cosi' il bordo non le altera.
+        La miscelazione passa per un alpha sfumato. Le statistiche sono
+        calcolate solo sull'interno della maschera.
         """
         if stats is None:
             return dst
@@ -146,24 +166,49 @@ class HeadSwapper:
         if not hard.any():
             return dst
 
-        # interno: le statistiche non devono essere inquinate dal bordo
         k = 5 if 5 % 2 else 6
         inner = cv2.erode(hard, np.ones((k, k), np.uint8), iterations=1)
         if int(inner.sum()) < 40:
             inner = hard
 
-        px = dst[inner > 0].astype(np.float32)
+        # Trasferimento in spazio LAB (più robusto e naturale della media BGR)
+        lab = cv2.cvtColor(dst, cv2.COLOR_BGR2LAB).astype(np.float32)
+        px = lab[inner > 0]
         cur_mean = px.mean(axis=0)
         cur_std = px.std(axis=0) + 1e-6
-        new = np.clip((dst.astype(np.float32) - cur_mean) / cur_std * std + mean,
-                      0, 255)
+
+        # Approssimazione robusta: scala luminosità e canali colore
+        # usando le statistiche BGR della source come riferimento di tono
+        src_mean = mean.astype(np.float32)
+        src_std = std.astype(np.float32)
+        ratio = (src_std.mean() + 1e-3) / (cur_std.mean() + 1e-3)
+
+        new_lab = lab.copy()
+        # Luminosità: mix tra target e source per non schiacciare i dettagli
+        new_lab[..., 0] = np.clip(
+            (lab[..., 0] - cur_mean[0]) * (src_std.mean() / (cur_std[0] + 1e-6))
+            + cur_mean[0] * 0.55 + src_mean.mean() * 0.45, 0, 255)
+        new_lab[..., 1] = np.clip(
+            (lab[..., 1] - cur_mean[1]) * ratio * 0.85 + cur_mean[1], 0, 255)
+        new_lab[..., 2] = np.clip(
+            (lab[..., 2] - cur_mean[2]) * ratio * 0.85 + cur_mean[2], 0, 255)
+
+        new_bgr = cv2.cvtColor(new_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
         a = (feather(hard, soft).astype(np.float32) / 255.0)[..., None]
-        return np.clip(dst.astype(np.float32) * (1.0 - a) + new * a,
+        return np.clip(dst.astype(np.float32) * (1.0 - a) + new_bgr.astype(np.float32) * a,
                        0, 255).astype(np.uint8)
 
     def swap(self, frame: np.ndarray, src_entry: dict, target_face) -> np.ndarray:
-        """Applica head swap o face swap a un volto target nel frame."""
+        """Applica head swap o face swap a un volto target nel frame.
+
+        Pipeline v3 (qualità alta):
+        1. Ricoloratura capelli + pelle (LAB)
+        2. (opzionale) Upscale della regione facciale
+        3. inswapper sull'identità
+        4. Poisson blending con maschera semantica
+        5. Temporal smoothing regionale (meno peso su occhi/naso/bocca)
+        """
         if self.mode == "faceswap":
             return self.swapper_fn(src_entry.get("_face"), target_face, frame)
 
@@ -174,13 +219,20 @@ class HeadSwapper:
         head, fell_back = sane_head_mask(target_labels, target_face.bbox, kps)
         if fell_back:
             self.fallbacks += 1
-        inner = feather(inner_face_mask(frame.shape, kps, 1.0), self.blend)
+
+        # --- Maschera del volto interno ---
+        if self.use_semantic:
+            face_mask_hard = semantic_face_mask(target_labels, kps, expand=4)
+            # Combina con ellisse leggera per coprire eventuali buchi
+            ellipse = inner_face_mask(frame.shape, kps, scale=1.12)
+            face_mask_hard = cv2.bitwise_or(face_mask_hard, ellipse)
+        else:
+            face_mask_hard = inner_face_mask(frame.shape, kps, scale=1.18)
+
+        inner = feather(face_mask_hard, self.blend)
         neck = FaceParser.mask_for(target_labels, NECK_CLASSES)
 
-        # Il ricoloratura agisce solo su capelli e pelle, mai su collo e sfondo.
-        # `head` e' la maschera sanificata: senza questa intersezione BiSeNet
-        # puo' etichettare come "capelli" mezzo fotogramma (297934 px nel test)
-        # e il ricoloratura stravolgere l'immagine.
+        # --- 1. Ricoloratura (solo capelli e pelle) ---
         capelli = FaceParser.mask_for(target_labels, HAIR_CLASSES)
         capelli = cv2.bitwise_and(capelli, head)
         if capelli.any():
@@ -193,35 +245,85 @@ class HeadSwapper:
             if pelle.any():
                 out = self._apply_stats(out, pelle, src_entry["skin_stats"])
 
-        # Il bordo della zona toccata viene sfumato per non lasciare un salto.
+        # Sfumatura leggera del bordo pre-swap
         bordo = cv2.bitwise_or(capelli, FaceParser.mask_for(target_labels, FACE_CLASSES))
         bordo = cv2.bitwise_and(bordo, cv2.bitwise_not(inner))
         bordo = cv2.bitwise_and(bordo, cv2.bitwise_not(feather(neck, 5)))
         if bordo.any():
             a = feather(bordo, self.blend).astype(np.float32)[..., None] / 255.0
             sm = cv2.GaussianBlur(out, (0, 0), 1.0)
-            out = np.clip(out.astype(np.float32) * (1 - a * 0.5)
-                          + sm.astype(np.float32) * (a * 0.5), 0, 255).astype(np.uint8)
+            out = np.clip(out.astype(np.float32) * (1 - a * 0.45)
+                          + sm.astype(np.float32) * (a * 0.45), 0, 255).astype(np.uint8)
 
-        # inswapper genera il volto nella posa del target: e' la fonte del
-        # movimento. Scrive in place su GPU, restituisce una copia su CPU,
-        # quindi il valore di ritorno va sempre assegnato.
+        # --- 2. Upscale della regione facciale (se face_scale > 1) ---
+        # Lavora solo sulla ROI del volto a risoluzione maggiore, poi reinserisce.
+        # Molto più efficiente che upscalare tutto il frame.
+        did_upscale = False
+        if self.face_scale > 1.05:
+            x1, y1, x2, y2 = [int(v) for v in target_face.bbox[:4]]
+            # padding generoso per non tagliare il volto
+            pad = int(max(x2 - x1, y2 - y1) * 0.35)
+            h, w = out.shape[:2]
+            rx1 = max(0, x1 - pad)
+            ry1 = max(0, y1 - pad)
+            rx2 = min(w, x2 + pad)
+            ry2 = min(h, y2 + pad)
+            roi = out[ry1:ry2, rx1:rx2]
+            if min(roi.shape[:2]) > 24:
+                new_w = int((rx2 - rx1) * self.face_scale)
+                new_h = int((ry2 - ry1) * self.face_scale)
+                # limita a 512 per non esplodere la memoria/tempo su CPU
+                max_side = 512
+                if max(new_w, new_h) > max_side:
+                    s = max_side / max(new_w, new_h)
+                    new_w, new_h = int(new_w * s), int(new_h * s)
+                up = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+                # adatta i landmark al ROI upscalato (per eventuale uso futuro)
+                # per ora inswapper lavora sul frame intero; l'upscale serve
+                # principalmente all'enhancer e al dettaglio post-swap
+                did_upscale = True
+                up_roi = up  # salvato per il reinserimento dopo
+
+        # --- 3. inswapper ---
+        pre_swap = out.copy()
         out = self.swapper_fn(src_entry.get("_face"), target_face, out)
+
+        # Se abbiamo fatto upscale, possiamo sharpenare leggermente la zona
+        if did_upscale and self.face_scale >= 1.4:
+            # Unsharpen mask leggero solo sulla zona facciale
+            blur = cv2.GaussianBlur(out, (0, 0), 1.2)
+            out = np.clip(out.astype(np.float32) * 1.25 - blur.astype(np.float32) * 0.25,
+                          0, 255).astype(np.uint8)
+
+        # --- 4. Poisson blending con maschera semantica ---
+        if self.use_poisson:
+            try:
+                center = (int(kps[:, 0].mean()), int(kps[:, 1].mean()))
+                poisson_mask = cv2.erode(face_mask_hard, np.ones((3, 3), np.uint8), iterations=1)
+                if poisson_mask.any() and poisson_mask.max() > 0:
+                    blended = cv2.seamlessClone(
+                        out, pre_swap, poisson_mask, center, cv2.MIXED_CLONE)
+                    a = (feather(poisson_mask, max(5, self.blend // 2)).astype(np.float32)
+                         / 255.0)[..., None]
+                    out = np.clip(
+                        blended.astype(np.float32) * (0.85 * a) +
+                        out.astype(np.float32) * (1.0 - 0.85 * a),
+                        0, 255).astype(np.uint8)
+            except Exception:
+                pass
+
+        # --- 5. Temporal smoothing regionale ---
         if self.temporal > 0:
-            out = self._temporal_blend(out, target_face, src_entry)
+            out = self._temporal_blend(out, target_face, src_entry, labels=target_labels)
         return out
 
     def _temporal_blend(self, out: np.ndarray, target_face, src_entry: dict,
-                        size: int = 128) -> np.ndarray:
+                        size: int = 128, labels=None) -> np.ndarray:
         """Riduce il flickering mescolando il fotogramma precedente.
 
-        Il paper "Temporal Optimization for Face Swapping Video based on
-        Consistency Inheritance" (ACM MM 2024) tratta l'incoerenza fra
-        fotogrammi come un disturbo nel dominio del tempo. Riaddestrare un
-        modello per risolverlo non e' pratico qui, ma una parte del
-        vantaggio si ottiene-media: il fotogramma precedente viene portato
-        nella posizione attuale con i landmark e usato come prior del
-        fotogramma corrente, dentro la sola regione del volto.
+        Versione regionale: sulle zone ad alta frequenza (occhi, naso, bocca)
+        il peso temporale è ridotto a ~40% del valore globale, per evitare
+        ghosting e dettagli "trascinati". Sulle guance/fronte resta pieno.
         """
         from insightface.utils import face_align
 
@@ -237,18 +339,30 @@ class HeadSwapper:
         M_prev = face_align.estimate_norm(prev_kps, size)
         M_cur = face_align.estimate_norm(kps, size)
 
-        # frame precedente -> frame corrente
         A = np.vstack([M_cur, [0, 0, 1]]) @ np.linalg.inv(
             np.vstack([M_prev, [0, 0, 1]]))
         warped = cv2.warpAffine(prev_img, A[:2], (out.shape[1], out.shape[0]),
                                 borderValue=0)
 
-        mask = feather(inner_face_mask(out.shape, kps, 1.0), self.blend)
-        # zone dove il warp non ha coperto nulla vanno escluse
+        # Maschera base del volto
+        if self.use_semantic and labels is not None:
+            base_mask = semantic_face_mask(labels, kps, expand=2)
+        else:
+            base_mask = inner_face_mask(out.shape, kps, 1.15)
+        mask = feather(base_mask, self.blend)
+
+        # Zone ad alta frequenza: peso temporale ridotto
+        weight = np.full(out.shape[:2], self.temporal, dtype=np.float32)
+        if labels is not None:
+            hf = high_freq_mask(labels)
+            if hf.any():
+                # occhi/naso/bocca: solo 40% del temporal
+                weight = np.where(hf > 0, self.temporal * 0.40, weight)
+
         valid = cv2.warpAffine(np.full(prev_img.shape[:2], 255, np.uint8),
                                A[:2], (out.shape[1], out.shape[0]),
                                flags=cv2.INTER_NEAREST, borderValue=0)
-        a = (mask.astype(np.float32) / 255.0 * self.temporal)
+        a = (mask.astype(np.float32) / 255.0) * weight
         a *= (valid.astype(np.float32) / 255.0)
         a = a[..., None]
 

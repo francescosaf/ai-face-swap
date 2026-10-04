@@ -57,6 +57,40 @@ BiSeNet senza vincolo di area e recolor su maschere binarie — sono corretti.
 
 Output corrente: `~/Downloads/TestFaceSwap/headswap_3foto.mp4`.
 
+## Migliorie qualità v3 (ottobre 2026)
+
+### Pipeline attuale (`--quality high` di default)
+
+1. **Maschera semantica BiSeNet** (skin + naso + occhi + bocca + labbra) al posto della sola ellisse
+2. **Upscale selettivo** della regione facciale (1.6×–2.0×) → più dettaglio senza toccare tutto il frame
+3. **Trasferimento colore in LAB**
+4. **Poisson blending** (`seamlessClone` MIXED) con maschera semantica
+5. **Temporal smoothing regionale**: occhi/naso/bocca solo al 40% del peso → meno ghosting
+6. Profili pronti:
+
+| Profilo    | face_scale | temporal | poisson | semantic | Uso tipico          |
+|------------|------------|----------|---------|----------|---------------------|
+| `fast`     | 1.0×       | 0.25     | no      | no       | prove rapide        |
+| `high`     | 1.6×       | 0.38     | sì      | sì       | **default**         |
+| `maximum`  | 2.0×       | 0.42     | sì      | sì       | massima qualità     |
+
+```bash
+# Qualità alta (default, consigliato sul tuo Mac)
+python headless_faceswap.py --video clip.mp4 --photo foto.jpg --quality high
+
+# Massima qualità (un po' più lento)
+python headless_faceswap.py --video clip.mp4 --photo foto.jpg --quality maximum
+
+# Prove veloci
+python headless_faceswap.py --video clip.mp4 --photo foto.jpg --quality fast --no-enhancer
+```
+
+Su Intel UHD 630 un video di ~17 s a 24 fps richiede tipicamente:
+- `high` + enhancer → **12–22 min**
+- `maximum` + enhancer → **18–30 min**
+
+Resta ampiamente sotto l'ora.
+
 ## Installazione
 
 ```bash

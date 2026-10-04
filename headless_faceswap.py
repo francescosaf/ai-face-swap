@@ -262,11 +262,15 @@ def main() -> int:
     ap.add_argument("--identities", type=int, default=0,
                     help="forza il numero di persone distinte nel video")
     ap.add_argument("--det-size", type=int, default=640, choices=[160, 320, 640])
-    ap.add_argument("--blend", type=int, default=9, help="sfumatura maschera (headswap)")
+    ap.add_argument("--quality", choices=["fast", "high", "maximum"], default="high",
+                    help="profilo qualità: fast | high (default) | maximum")
+    ap.add_argument("--blend", type=int, default=None, help="sfumatura maschera (override quality)")
     ap.add_argument("--harmonize", type=float, default=1.0,
                     help="0 disattiva l'armonizzazione del tono pelle (headswap)")
-    ap.add_argument("--temporal", type=float, default=0.35,
-                    help="0 disattiva lo smorzamento temporale (0-1, headswap)")
+    ap.add_argument("--temporal", type=float, default=None,
+                    help="0 disattiva lo smorzamento temporale (override quality)")
+    ap.add_argument("--face-scale", type=float, default=None,
+                    help="upscale regione facciale (1.0-2.5, override quality)")
     ap.add_argument("--crf", type=int, default=17)
     ap.add_argument("--limit-frames", type=int, default=0, help="test: procesa N frame")
     ap.add_argument("--save-masks", type=Path, help="salva le maschere del primo frame")
@@ -297,6 +301,10 @@ def main() -> int:
     enhancer = not args.no_enhancer
     log(f"  Modalita': {mode}")
     log(f"  Provider : {providers[0]}")
+    log(f"  Quality  : {args.quality}")
+    log(f"  Enhancer : {'GFPGAN ATTIVO' if enhancer else 'disattivato (--no-enhancer)'}")
+    if args.temporal is not None or args.blend is not None:
+        log(f"  Override : temporal={args.temporal}  blend={args.blend}  face_scale={args.face_scale}")
     if prompt:
         log(f"  Prompt   : registrato (documentale, non usato dai modelli ONNX)")
     if mode == "headswap":
@@ -319,10 +327,20 @@ def main() -> int:
     swapper = None
     if mode == "headswap":
         from head_swap import HeadSwapper
-        swapper = HeadSwapper(DL_DIR / "models", providers, M["swapper"].swap_face,
-                              mode="headswap", blend=args.blend,
-                              harmonize=args.harmonize, temporal=args.temporal)
-        log("[headswap] parser BiSeNet pronto\n")
+        # Costruisci i kwargs: quality ha priorità, gli override espliciti vincono
+        kw = dict(mode="headswap", harmonize=args.harmonize, quality=args.quality)
+        if args.blend is not None:
+            kw["blend"] = args.blend
+        if args.temporal is not None:
+            kw["temporal"] = args.temporal
+        if args.face_scale is not None:
+            kw["face_scale"] = args.face_scale
+        swapper = HeadSwapper(DL_DIR / "models", providers, M["swapper"].swap_face, **kw)
+        q = HeadSwapper.QUALITY.get(args.quality, {})
+        log(f"[headswap] parser BiSeNet pronto  |  semantic={swapper.use_semantic}  "
+            f"poisson={swapper.use_poisson}  face_scale={swapper.face_scale:.1f}x  "
+            f"temporal={swapper.temporal:.2f}  blend={swapper.blend}")
+        log("")
     entries = [swapper.prepare_source(img, face) for _, img, face in loaded] if swapper else None
 
     from video_face_roster import build_tracks, cluster_identities

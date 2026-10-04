@@ -105,7 +105,10 @@ Ordine delle operazioni in `head_swap.py`, per frame e per volto:
 4. **ricoloratura**: il rapporto dei colori della pelle allinea la sorgente all'illuminazione del target
 5. **composizione**: `out = out·(1−α) + testa_warpiata·α`
 6. **protezione del collo**: `α` forzato a zero sul collo
-7. sfumatura del bordo e passaggio a GFPGAN (se attivo)
+7. **Poisson blending** (seamlessClone MIXED) dopo inswapper per integrare
+   il volto e ridurre glitch sul naso
+8. sfumatura del bordo e passaggio a GFPGAN (se attivo)
+9. smorzamento temporale (default 0.42)
 
 Due dettagli che sono stati bug reali, entrambi trovati con le metriche:
 

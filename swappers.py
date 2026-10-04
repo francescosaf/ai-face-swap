@@ -36,7 +36,9 @@ SWAPPERS = {
 }
 
 # ellisse che copre il viso nel crop del template arcface
-CROP_MASK = {"cx": 0.50, "cy": 0.56, "ax": 0.40, "ay": 0.46}
+# Allargata e spostata leggermente verso il basso per coprire meglio
+# naso e parte superiore del mento (riduce glitch tipici).
+CROP_MASK = {"cx": 0.50, "cy": 0.58, "ax": 0.43, "ay": 0.50}
 
 
 def estimate_norm(kps, size: int) -> np.ndarray:
@@ -64,12 +66,13 @@ def from_tensor(x: np.ndarray) -> np.ndarray:
 
 
 def crop_mask(size: int) -> np.ndarray:
-    """Maschera ellittica del viso, nello spazio del crop del modello."""
+    """Maschera ellittica del viso, nello spazio del crop del modello.
+    Blur più aggressivo per bordi più soft (riduce glitch sul naso)."""
     m = np.zeros((size, size), np.uint8)
     c = CROP_MASK
     cv2.ellipse(m, (int(size * c["cx"]), int(size * c["cy"])),
                 (int(size * c["ax"]), int(size * c["ay"])), 0, 0, 360, 255, -1)
-    k = max(3, size // 16)
+    k = max(5, size // 12)  # blur più forte
     if k % 2 == 0:
         k += 1
     return cv2.GaussianBlur(m, (k, k), 0)
