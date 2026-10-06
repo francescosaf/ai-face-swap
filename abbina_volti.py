@@ -57,7 +57,7 @@ def carica_analyser(provider: str, det_size: int = 640) -> FaceAnalysis:
     return app
 
 
-def _retry_soglia_bassa(app, img, soglia=0.25, minimo=0.30):
+def _retry_soglia_bassa(app, img, soglia=0.25, minimo=0.25):
     """Seconda prova con soglia ridotta, come in face_analyser."""
     det = getattr(app, "det_model", None)
     if det is None:

@@ -141,23 +141,49 @@ def _iou_iou(a, b) -> float:
 
 
 def _righe_vicine(mappa_frame, i: int, _voxel: int = 6):
-    """Assegnazione dei frame adiacenti, se tutte concordano.
+    """Righe dei frame adiacenti, se concordano sulla foto.
 
-    Ritorna la foto da usare quando il frame non ha righe proprie, o None
-    se i vicini non concordano (due persone diverse in campo, o la scena
-    cambia): in quel caso non si indovina e il volto resta com'e'.
+    Ritorna [(bbox, foto)] del punto in cui i vicini si incontrano, o None
+    se non concordano (due persone diverse in campo, o la scena cambia):
+    in quel caso non si indovina e il volto resta com'e'.
     """
     for d in range(1, _voxel + 1):
-        p_index = set()
+        raccolte = []
         for j in (i - d, i + d):
-            for bbox, idx in mappa_frame.get(j, ()):
-                p_index.add(idx)
-        if len(p_index) == 1:
-            return p_index.pop()
-        if len(p_index) > 1:
-            # i vicini concordano: due persone diverse o cambio di scena
+            raccolte.extend(mappa_frame.get(j, ()))
+        if raccolte:
+            if len({idx for _, idx in raccolte}) == 1:
+                return raccolte
             return None
     return None
+
+
+def _scegli_riga(righe, bbox, soglia=1.0):
+    """Foto della riga il cui volto e' piu' vicino a `bbox`.
+
+    Ritorna l'indice foto, oppure None se nessuna riga e' abbastanza
+    vicina. Serve perche' un frame senza righe puo' contenere una persona
+    diversa da quella dei frame adiacenti: darle il volto di quella
+    sarebbe uno scambio visibile. La distanza e' normalizzata sulla
+    larghezza del volto rilevato: piu' di una larghezza di distanza e'
+    un altro soggetto. Un volto che si sposta davvero non supera mai
+    quella soglia, uno lontano si.
+    """
+    cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+    # normalizzazione sulla larghezza del volto rilevato: due persone in
+    # campo stanno a meta' dell'uno dall'altro al massimo, mentre il volto
+    # stesso si sposta di molto meno. Con il lato maggiore invece la
+    # soglia scattava appena (un volto alto 600px assorbiva 450px di
+    # distanza e il secondo soggetto veniva scambiato).
+    px = max(bbox[2] - bbox[0], bbox[3] - bbox[1], 1.0)
+    migliore, migliore_d = None, None
+    for rb, idx in righe:
+        rx = (rb[0] + rb[2]) / 2.0
+        ry = (rb[1] + rb[3]) / 2.0
+        d = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5 / px
+        if migliore_d is None or d < migliore_d:
+            migliore, migliore_d = idx, d
+    return migliore if migliore_d is not None and migliore_d <= soglia else None
 
 
 def probe_video(path: Path) -> dict:
@@ -202,6 +228,10 @@ def load_modules(providers, enhancer, det_size, mode):
     g.det_size = det_size
     g.many_faces = False
     g.map_faces = True
+    # il detector a 0.5 perde i volti ai margini e in movimento: in
+    # faceswap la mappa decide comunque chi scambiare, quindi si puo'
+    # abbassare. In headswap cambierebbe il tracciamento, resta 0.5.
+    g.det_thresh_ridotto = (mode == "faceswap")
     g.opacity = 1.0
     g.mouth_mask = False
     g.sharpness = 0.0
@@ -543,6 +573,7 @@ def main() -> int:
         lasciati = 0
         frames_persi = []
         ripreso_vicini = 0
+        scartati_distanza = 0
         saved = False
         for i, fp in enumerate(frame_paths):
             frame = cv2.imread(str(fp))
@@ -573,7 +604,14 @@ def main() -> int:
                                 senza_mappa += 1
                                 frames_persi.append(i)
                                 continue
-                            src = vicini
+                            # un frame senza righe puo' contenere un'altra
+                            # persona: se la riga vicina non le corrisponde,
+                            # il volto resta suo invece di ricevere quello
+                            # dei frame adiacenti
+                            src = _scegli_riga(vicini, f.bbox)
+                            if src is None:
+                                scartati_distanza += 1
+                                continue
                             ripreso_vicini += 1
                         else:
                             fb = f.bbox.astype(float)
@@ -585,10 +623,16 @@ def main() -> int:
                             if iou < 0.30:
                                 # il detector ha riallineato il box fra il
                                 # riconoscimento e lo swap. Con una sola riga il
-                                # volto e' univoco: usarla invece di saltare il
-                                # frame evita che la persona torni originale.
+                                # volto e' quasi univoco: usarla invece di
+                                # saltare il frame evita che la persona torni
+                                # originale, ma solo se il volto rilevato le
+                                # corrisponde davvero (altrimenti in scena ce
+                                # n'e' un'altra, e la si lascia com'e').
                                 if len(righe_frame) == 1:
-                                    src = righe_frame[0][1]
+                                    src = _scegli_riga(righe_frame, f.bbox)
+                                    if src is None:
+                                        scartati_distanza += 1
+                                        continue
                                 else:
                                     senza_mappa += 1
                                     frames_persi.append(i)
@@ -622,6 +666,9 @@ def main() -> int:
                 f"smorzati, correzione media "
                 f"{100 * swapper._kps_correzione / swapper._kps_aggiornati:.2f}% "
                 f"del lato del viso")
+        if scartati_distanza:
+            log(f"  Altre     : {scartati_distanza} volti lasciati com'e' "
+                f"(altro soggetto nel frame, non il volto della mappa)")
         if ripreso_vicini:
             log(f"  Vicini    : {ripreso_vicini} volti ripresi dai frame "
                 f"adiacenti (il CSV non aveva riga per il frame)")
