@@ -124,6 +124,42 @@ def ensure_models(use_cuda: bool, enhancer: bool, headswap: bool) -> None:
         log("[modelli] bisenet_resnet18.onnx pronto per il parsing")
 
 
+def _iou_iou(a, b) -> float:
+    """IoU fra due bbox in formato (x1, y1, x2, y2)."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = ix2 - ix1, iy2 - iy1
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    area_a = max(ax2 - ax1, 0) * max(ay2 - ay1, 0)
+    area_b = max(bx2 - bx1, 0) * max(by2 - by1, 0)
+    unione = area_a + area_b - inter
+    return inter / unione if unione > 0 else 0.0
+
+
+def _righe_vicine(mappa_frame, i: int, _voxel: int = 6):
+    """Assegnazione dei frame adiacenti, se tutte concordano.
+
+    Ritorna la foto da usare quando il frame non ha righe proprie, o None
+    se i vicini non concordano (due persone diverse in campo, o la scena
+    cambia): in quel caso non si indovina e il volto resta com'e'.
+    """
+    for d in range(1, _voxel + 1):
+        p_index = set()
+        for j in (i - d, i + d):
+            for bbox, idx in mappa_frame.get(j, ()):
+                p_index.add(idx)
+        if len(p_index) == 1:
+            return p_index.pop()
+        if len(p_index) > 1:
+            # i vicini concordano: due persone diverse o cambio di scena
+            return None
+    return None
+
+
 def probe_video(path: Path) -> dict:
     r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                         "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
@@ -256,20 +292,49 @@ def main() -> int:
     ap.add_argument("--prompt", help="prompt di riferimento (documentale: i modelli ONNX "
                                      "non accettano testo)")
     ap.add_argument("--provider", choices=["cuda", "coreml", "cpu"])
-    ap.add_argument("--no-enhancer", action="store_true", help="disattiva GFPGAN")
+    ap.add_argument("--no-enhancer", action="store_true",
+                    help="disattiva GFPGAN. Sul questo materiale spingeva i "
+                         "dettagli della pelle al 400% dell'originale, e "
+                         "quel contrasto in piu' sul video originale si legge "
+                         "come sfarfallio.")
+    ap.add_argument("--mappa-file", type=Path, default=None,
+                    help="CSV frame->foto prodotto da abbina_volti.py. Se "
+                         "passato, la foto da usare e' presa dal file per ogni "
+                         "frame e il clustering interno viene ignorato: e' il "
+                         "modo sicuro perche' i due algoritmi di "
+                         "raggruppamento possono dare numeri di persone "
+                         "diversi e --map finirebbe sugli indici sbagliati.")
     ap.add_argument("--map", dest="mapping",
                     help="quale foto per ogni persona: es. 0,1,0 (indice foto)")
     ap.add_argument("--identities", type=int, default=0,
                     help="forza il numero di persone distinte nel video")
-    ap.add_argument("--det-size", type=int, default=640, choices=[160, 320, 640])
+    ap.add_argument("--det-size", type=int, default=640, choices=[160, 320, 640, 1024],
+                    help="dimensione di ingresso del detector. Piu' alta "
+                         "trova volti piccoli con keypoint piu' precisi: su "
+                         "riprese in movimento e' la leva che riduce davvero "
+                         "il tremito, molto piu' del blending temporale.")
     ap.add_argument("--quality", choices=["fast", "high", "maximum"], default="high",
                     help="profilo qualità: fast | high (default) | maximum")
     ap.add_argument("--blend", type=int, default=None, help="sfumatura maschera (override quality)")
+    ap.add_argument("--swapper", choices=["inswapper", "hyperswap", "hififace"],
+                    default="inswapper",
+                    help="modello di sostituzione: inswapper 128px (solo identita', "
+                         "conserva gli accessori del video) oppure hyperswap/hififace "
+                         "256px, che sostituiscono l'intera testa e restituiscono la "
+                         "propria maschera")
+    ap.add_argument("--zoom", type=float, default=1.0,
+                    help="ingrandisce il ritaglio prima dello swap (1.0 = disattivato: "
+                         "con HyperSwap abbatte la maschera e lo swap non viene applicato)")
     ap.add_argument("--hair-transfer", type=int, default=None,
                     help="0 disattiva il trapianto geometrico dei capelli "
                          "(override quality): evita l'effetto sticker/cutout")
-    ap.add_argument("--harmonize", type=float, default=1.0,
+    ap.add_argument("--harmonize", type=float, default=None,
                     help="0 disattiva l'armonizzazione del tono pelle (headswap)")
+    ap.add_argument("--stabilizza", type=float, default=None,
+                    help="smorzamento temporale dei keypoint del detector "
+                         "(0=off, 1=massimo). E' la leva principale contro "
+                         "il flickering: senza, il ritaglio di inswapper "
+                         "trema perche' segue il tremito del detector.")
     ap.add_argument("--temporal", type=float, default=None,
                     help="0 disattiva lo smorzamento temporale (override quality)")
     ap.add_argument("--face-scale", type=float, default=None,
@@ -328,21 +393,51 @@ def main() -> int:
         log("")
 
     swapper = None
-    if mode == "headswap":
+    if mode in ("headswap", "faceswap"):
         from head_swap import HeadSwapper
         # Costruisci i kwargs: quality ha priorità, gli override espliciti vincono
-        kw = dict(mode="headswap", harmonize=args.harmonize, quality=args.quality)
+        scambiatore = None
+        if mode == "faceswap":
+            args.harmonize = 0.0
+            args.hair_transfer = 0
+        head256 = args.swapper != "inswapper"
+        # Con uno swapper a 256px la testa viene rigerata: ricolorare i capelli
+        # e trapiantarne la geometria dalla foto non serve (ed e' cio' che
+        # produceva l'effetto sticker). L'upscale del preset invece resta utile,
+        # ma hyper_swap fa gia' da se' il suo zoom sulla sorgente.
+        if args.harmonize is None:
+            args.harmonize = 0.0 if head256 else 1.0
+        if head256 and args.hair_transfer is None:
+            args.hair_transfer = 0
+        kw = dict(mode=mode, harmonize=args.harmonize, quality=args.quality)
         if args.blend is not None:
             kw["blend"] = args.blend
         if args.temporal is not None:
             kw["temporal"] = args.temporal
+        elif mode == "faceswap":
+            # Nel faceswap il preset 'high' attivava il blend temporale, che
+            # su una testa in movimento trascina l'immagine del frame
+            # precedente: risultava piu' sfocato del faceswap diretto, che e'
+            # il comportamento migliore. Resta attivabile a mano con
+            # --temporal, ma non e' il default.
+            kw["temporal"] = 0.0
+        if args.stabilizza is not None:
+            kw["stabilizza"] = args.stabilizza
         if args.face_scale is not None:
             kw["face_scale"] = args.face_scale
         if args.hair_transfer is not None:
             kw["hair"] = bool(args.hair_transfer)
         swapper = HeadSwapper(DL_DIR / "models", providers, M["swapper"].swap_face, **kw)
         q = HeadSwapper.QUALITY.get(args.quality, {})
-        log(f"[headswap] trapianto capelli = {swapper.hair_transfer}")
+        if head256 and mode == "headswap":
+            import hyper_swap
+            scambiatore = hyper_swap.carica(args.swapper, DL_DIR / "models",
+                                            zoom=args.zoom)
+            swapper.swapper_fn = scambiatore.swap
+            log(f"[headswap] modello: {args.swapper} 256px con maschera propria")
+        log(f"[headswap] trapianto capelli = {swapper.hair_transfer}"
+            f"   armonizzazione = {swapper.harmonize}"
+            f"   face_scale = {swapper.face_scale:.2f}")
         log(f"[headswap] parser BiSeNet pronto  |  semantic={swapper.use_semantic}  "
             f"poisson={swapper.use_poisson}  face_scale={swapper.face_scale:.1f}x  "
             f"temporal={swapper.temporal:.2f}  blend={swapper.blend}")
@@ -412,20 +507,98 @@ def main() -> int:
             log("  video_face_roster.py e poi --map per fissarlo a mano.\n")
 
         centroids = np.vstack([p["centroid"] for p in people])
+
+        mappa_frame = None
+        if args.mappa_file:
+            import csv as _csv
+            with open(args.mappa_file, newline="") as fh:
+                rd = _csv.DictReader(fh)
+                if "frame" not in rd.fieldnames or "foto_indice" not in rd.fieldnames:
+                    print(f"[errore] {args.mappa_file} non ha le colonne "
+                          f"frame e foto_indice")
+                    return 1
+                mappa_frame = {}
+                for riga in rd:
+                    if riga["foto_indice"] == "":
+                        continue
+                    idx = int(riga["foto_indice"])
+                    if not -1 <= idx < len(loaded):
+                        print(f"[errore] il file punta alla foto {idx}, "
+                              f"disponibili 0..{len(loaded)-1}")
+                        return 1
+                    bbox = (int(riga["x1"]), int(riga["y1"]),
+                            int(riga["x2"]), int(riga["y2"]))
+                    mappa_frame.setdefault(int(riga["frame"]), []).append((bbox, idx))
+            log(f"  Mappa    : {len(mappa_frame)} frame, "
+                f"{sum(len(v) for v in mappa_frame.values())} volti da "
+                f"{args.mappa_file.name} (clustering interno ignorato)")
+            if not mappa_frame:
+                log("[errore] la mappa e' vuota: rilassa abbina_volti.py "
+                    "con --assegna")
+                return 1
+
         t0 = time.time()
         swapped = 0
+        senza_mappa = 0
+        lasciati = 0
+        frames_persi = []
+        ripreso_vicini = 0
         saved = False
         for i, fp in enumerate(frame_paths):
             frame = cv2.imread(str(fp))
             if frame is None:
                 continue
+            if swapper is not None:
+                swapper.nuovo_frame(i)
             faces = M["many"](frame)
             if faces:
                 for f in faces:
                     if f.normed_embedding is None:
                         continue
-                    who = int(np.argmax(centroids @ f.normed_embedding))
-                    src = sel[who]
+                    if mappa_frame is not None:
+                        # Un frame puo' avere piu' persone: la mappa e' per
+                        # frame E per bbox, non solo per frame. Con una mappa
+                        # solo per frame i due volti ricevevano la stessa
+                        # foto e una delle due persone spariva dal video.
+                        righe_frame = mappa_frame.get(i)
+                        if not righe_frame:
+                            # Il detector del passo di riconoscimento non vede
+                            # tutti i frame che il passo di swap vede: capita
+                            # su un volto che sfuma o che e' marginale. Il
+                            # volto persiste fra frame adiacenti, quindi si
+                            # prende l'assegnazione dei vicini invece di
+                            # lasciar tornare la persona originale a sorpresa.
+                            vicini = _righe_vicine(mappa_frame, i, _voxel=6)
+                            if vicini is None:
+                                senza_mappa += 1
+                                frames_persi.append(i)
+                                continue
+                            src = vicini
+                            ripreso_vicini += 1
+                        else:
+                            fb = f.bbox.astype(float)
+                            src, iou = None, 0.0
+                            for bbox, idx in righe_frame:
+                                r = _iou_iou(fb, bbox)
+                                if r > iou:
+                                    src, iou = idx, r
+                            if iou < 0.30:
+                                # il detector ha riallineato il box fra il
+                                # riconoscimento e lo swap. Con una sola riga il
+                                # volto e' univoco: usarla invece di saltare il
+                                # frame evita che la persona torni originale.
+                                if len(righe_frame) == 1:
+                                    src = righe_frame[0][1]
+                                else:
+                                    senza_mappa += 1
+                                    frames_persi.append(i)
+                                    continue
+                        if src == -1:
+                            lasciati += 1
+                            continue
+                    else:
+                        who = int(np.argmax(centroids @ f.normed_embedding))
+                        src = sel[who]
                     if swapper is not None:
                         frame = swapper.swap(frame, entries[src], f)
                     else:
@@ -444,6 +617,21 @@ def main() -> int:
                 log(f"  [{done:>4}/{total}] {rate:.2f} fps  "
                     f"ETA {(total-done)/max(rate,1e-6)/60:5.1f} min  swap: {swapped}")
 
+        if swapper is not None and swapper._kps_aggiornati:
+            log(f"  Stabilizz : {swapper._kps_aggiornati} volti con keypoint "
+                f"smorzati, correzione media "
+                f"{100 * swapper._kps_correzione / swapper._kps_aggiornati:.2f}% "
+                f"del lato del viso")
+        if ripreso_vicini:
+            log(f"  Vicini    : {ripreso_vicini} volti ripresi dai frame "
+                f"adiacenti (il CSV non aveva riga per il frame)")
+        if lasciati:
+            log(f"  Originali: {lasciati} volti lasciati al volto originale "
+                f"su richiesta (mappa = -1)")
+        if senza_mappa:
+            log(f"  Mappa    : {senza_mappa} volti lasciati intatti, frame "
+                f"{frames_persi[:14]}{' ...' if len(frames_persi) > 14 else ''} "
+                f"(bbox non combaciante e piu' righe per frame)")
         if swapped == 0:
             log("\n[errore] NESSUN volto sostituito. L'output sarebbe identico all'originale.")
             log("         Cause probabili: volti troppo picchi, di profilo, o coperti.")
@@ -457,6 +645,14 @@ def main() -> int:
         log(f"  Output   : {args.output}")
         log(f"  Scambi   : {swapped} su {total} frame in {el/60:.1f} min "
             f"({total/el:.2f} fps)")
+        if swapper is not None:
+            log(f"  Fallback : {swapper._fallback_usati} frame tenuti dal "
+                "frame precedente (il modello non aveva scambiato)")
+        if scambiatore is not None:
+            log(f"  Modello  : {scambiatore._deblur_usati} frame recuperati "
+                f"con la sfocatura inversa, {scambiatore._falliti} senza "
+                f"scambio ({scambiatore._riusi} risolti riusando l'ultimo "
+                "scambio riuscito)")
         log(f"  Video    : {total/info['fps']:.2f}s")
         log("=" * 64)
         return 0

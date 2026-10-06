@@ -101,7 +101,9 @@ class HeadSwapper:
                  blend: int | None = None, harmonize: float = 1.0,
                  temporal: float | None = None, face_scale: float | None = None,
                  use_poisson: bool | None = None, use_semantic: bool | None = None,
-                 hair: bool | None = None, quality: str | None = None):
+                 hair: bool | None = None, hold_on_fail: bool = False,
+                 quality: str | None = None,
+                 stabilizza: float | None = None):
         # I default sono None per distinguere "non passato" da "passato":
         # il preset --quality fornisce i valori, ma un override esplicito
         # della CLI deve poter vincere sul preset.
@@ -112,18 +114,52 @@ class HeadSwapper:
         use_poisson = q.get("poisson", True) if use_poisson is None else use_poisson
         use_semantic = q.get("semantic", True) if use_semantic is None else use_semantic
         q = q or {}
+        # Smorzamento dei keypoint. Spento di default: misurato su questo
+        # materiale (dove la testa si sposta di ~27px per frame durante una
+        # panoramica) il filtro introduce piu' flickering di quanto ne
+        # elimini, perche' insegue il movimento con ritardo. Resta
+        # disponibile per video con soggetti fermi.
+        stabilizza = 0.0 if stabilizza is None else float(stabilizza)
+        stabilizza = max(0.0, min(stabilizza, 1.0))
         self.mode = mode
         self.swapper_fn = swapper_fn
         self.blend = blend
         self.hair_transfer = bool(q.get("hair", True)) if hair is None else bool(hair)
         self.harmonize = harmonize
+        # Il fallback tiene il frame precedente quando non si vede alcun
+        # cambio. Sta spento perche' ora e' hyper_swap a gestire i propri
+        # frame deboli (scaletta di deblur + riuso dell'ultimo scambio): qui il
+        # controllo e' piu' grossolano, misura sul bbox dopo il blending
+        # poisson, e sui frame validi ma sfumati dava falsi positivi
+        # congelando una testa che invece era stata scambiata bene.
+        self.hold_on_fail = bool(hold_on_fail)
         self.temporal = temporal
+        self.stabilizza = stabilizza
         self.face_scale = max(1.0, min(face_scale, 2.5))  # clamp
         self.use_poisson = use_poisson
         self.use_semantic = use_semantic
         self.parser = FaceParser(models_dir, providers)
         self._src_cache: dict = {}
         self._prev: dict = {}
+        # Stabilizzatore dei keypoint. La regione incollata da inswapper e'
+        # interamente definita da norm_crop2(target_face.kps): se i 5
+        # keypoint del detector vibrano da un frame all'altro, il viso
+        # incollato scala e si sposta diframe in frame. E' la causa
+        # principale del flickering e nessuna sfumatura temporale la
+        # corregge, perche' anche lei si appoggia ai kps.
+        self._track: dict = {}
+        self._frame_idx = -1
+        # HyperSwap su volti piccoli fallisce e restituisce il viso originale:
+        # in video si vede come alternanza fra la persona del video e quella
+        # della foto. Teniamo l'ultimo scambio riuscito e lo riusiamo per
+        # qualche frame invece di lasciare il viso originale.
+        self._fallback = 0
+        self._kps_scatto = 0
+        self._auto_idx = 0
+        self._kps_correzione = 0.0
+        self._kps_aggiornati = 0
+        self._fallback_max = 4
+        self._fallback_usati = 0
         self.fallbacks = 0
 
     def prepare_source(self, src_img: np.ndarray, src_face) -> dict:
@@ -306,6 +342,65 @@ class HeadSwapper:
                            cv2.COLOR_LAB2BGR)
         return out
 
+    def _stabilizza(self, target_face, key, frame_idx: int):
+        """Smorza i keypoint del detector per non far tremare il ritaglio.
+
+        Restituisce (kps_smorzati, scarto_px, scarto_rel), oppure None se lo
+        stabilizzatore e' disattivo o non c'e' ancora uno storico.
+
+        Lo smorzamento e' adattivo: quando la testa si muove davvero il
+        detector segue il movimento e lo si filtra poco; quando la testa e'
+        ferma il residuo e' rumore e lo si filtra forte. Un filtro a media
+        mobile fisso laggerebbe sui movimenti reali, che e' esattamente il
+        ghosting che si voleva evitare.
+        """
+        if self.stabilizza <= 0:
+            return None
+        if self._frame_idx < 0:
+            # nessun chiamante ha annunciato il cambio frame: uso un
+            # contatore interno, cosi' lo stabilizzatore resta attivo anche
+            # se lo script non conosce questa API
+            self._auto_idx += 1
+            frame_idx = self._auto_idx
+        else:
+            frame_idx = self._frame_idx
+        grezzi = np.asarray(target_face.kps, np.float32)
+        st = self._track.get(key)
+
+        if st is None or frame_idx <= st["idx"]:
+            # nessuno storico, oppure il volto e' sparito e ricomparso:
+            # ripartire da zero evita di trascinare una posizione vecchia
+            self._track[key] = {"idx": frame_idx, "kps": grezzi.copy()}
+            return None
+
+        vel = float(np.abs(grezzi - st["kps"]).mean())
+        lato = float(np.linalg.norm(grezzi[0] - grezzi[2]) + 1e-6) / 2.0
+        rumore = vel / max(lato, 1.0)
+        # 0.002 = puro tremito del detector, 0.020 = movimento tipico
+        movimento = min(max((rumore - 0.002) / 0.020, 0.0), 1.0)
+        # in quieto filtriamo forte, in movimento seguiamo
+        a = 0.55 * (1.0 - movimento) + 0.12 * movimento
+        a = 1.0 - (1.0 - a) * self.stabilizza
+        sm = st["kps"] * (1.0 - a) + grezzi * a
+        self._track[key] = {"idx": frame_idx, "kps": sm.copy()}
+        scarto_rel = float(np.abs(sm - grezzi).mean() / max(lato, 1.0))
+        return sm, vel, scarto_rel
+
+    def nuovo_frame(self, idx: int):
+        """Da chiamare una volta per frame, prima di scambiare i volti.
+
+        Serve a far avanzare lo storico dello stabilizzatore: senza, i volti
+        multipli dello stesso frame sembrerebbero frame diversi.
+        """
+        self._frame_idx = idx
+
+    def _forza_residua(self, st):
+        """Peso del blending temporale in funzione dello scarto dei kps."""
+        if st is None:
+            return None
+        return float(np.clip(self.temporal * (0.6 + 3.0 * st[2]),
+                             self.temporal, min(0.85, self.temporal * 3 + 0.2)))
+
     def swap(self, frame: np.ndarray, src_entry: dict, target_face) -> np.ndarray:
         """Applica head swap o face swap a un volto target nel frame.
 
@@ -317,7 +412,37 @@ class HeadSwapper:
         5. Temporal smoothing regionale (meno peso su occhi/naso/bocca)
         """
         if self.mode == "faceswap":
-            return self.swapper_fn(src_entry.get("_face"), target_face, frame)
+            out = self.swapper_fn(src_entry.get("_face"), target_face, frame)
+            # Anche in faceswap serve il blend temporale: applicato a mano
+            # ogni frame, il bounding box del detector oscilla e il viso in
+            #collato tremola. Senza questo passaggio il flickering e' il
+            # difetto principale della modalita' faceswap.
+            key = id(src_entry.get("_face"))
+            kps_reali = np.asarray(target_face.kps, np.float32).copy()
+            st = self._stabilizza(target_face, key, self._frame_idx)
+            if st is not None:
+                # inswapper ritaglia e ricolloca in base ai kps: con keypoint
+                # fermi il ritaglio non trema piu' fra un frame e l'altro.
+                # I kps veri vengono subito rimessi, cosi' enhancer e
+                # diagnostica continuano a vedere il volto reale.
+                target_face.kps = st[0].copy()
+            try:
+                out = self.swapper_fn(src_entry.get("_face"), target_face, frame)
+            finally:
+                target_face.kps = kps_reali
+            # residuo di texture: blending temporale guidato dai kps
+            # smorzati, cosi' il warp fra frame consecutivi e' coerente
+            if self.temporal > 0:
+                out = self._temporal_blend(
+                    out, target_face, src_entry,
+                    forza=self._forza_residua(st),
+                    kps_sm=st[0] if st is not None else None)
+            if st is not None:
+                self._kps_correzione += st[2]
+                self._kps_aggiornati += 1
+                if st[2] > 0.02:
+                    self._kps_scatto += 1
+            return out
 
         out = frame.copy()
         kps = np.asarray(target_face.kps, np.float32)
@@ -429,13 +554,58 @@ class HeadSwapper:
             except Exception:
                 pass
 
+        # --- 4b. il modello ha fallito? ---
+        # Uno swapper a 256px su un volto di poche decine di pixel a volte
+        # restituisce un'immagine valida ma senza scambiare nulla. Se il
+        # ritaglio del viso e' rimasto quasi identico, si riusa l'ultimo
+        # scambio riuscito invece di mostrare il viso originale.
+        if self.hold_on_fail:
+            scambiato = self._cambiata(pre_swap, out, target_face)
+            if scambiato:
+                self._fallback = 0
+            else:
+                self._fallback += 1
+                self._fallback_usati += 1
+                if self._fallback <= self._fallback_max:
+                    out = self._temporal_blend(out, target_face, src_entry,
+                                              labels=target_labels, forza=0.95)
+                else:
+                    self._fallback = 0
+
         # --- 5. Temporal smoothing regionale ---
         if self.temporal > 0:
             out = self._temporal_blend(out, target_face, src_entry, labels=target_labels)
         return out
 
+    @staticmethod
+    def _cambiata(pre: np.ndarray, post: np.ndarray, target_face) -> bool:
+        """True se lo swap ha cambiato davvero il ritaglio del viso.
+
+        Non si usa la differenza media sul bbox: lo swap tocca solo il volto,
+        circa un quinto del bbox, quindi la media si diluisce e uno scambio
+        reale sembra piccolo. Misura la frazione di pixel del bbox cambiati
+        oltre una soglia: sui volti reali e' 15-34%, sui frame in cui il
+        modello non ha scambiato 1-2%.
+        """
+        x1, y1, x2, y2 = [int(v) for v in target_face.bbox[:4]]
+        h, w = pre.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return True
+        a = pre[y1:y2, x1:x2].astype(np.int16)
+        b = post[y1:y2, x1:x2].astype(np.int16)
+        if a.shape != b.shape:
+            # Non deve capitare, ma un solo frame non puo' far abortire un
+            # run da 400 frame: si assume che lo swap sia avvenuto.
+            return True
+        d = np.abs(a - b).max(axis=2)
+        return float((d > 10).mean()) > 0.08
+
     def _temporal_blend(self, out: np.ndarray, target_face, src_entry: dict,
-                        size: int = 128, labels=None) -> np.ndarray:
+                        size: int = 128, labels=None,
+                        forza: float | None = None,
+                        kps_sm: np.ndarray | None = None) -> np.ndarray:
         """Riduce il flickering mescolando il fotogramma precedente.
 
         Versione regionale: sulle zone ad alta frequenza (occhi, naso, bocca)
@@ -443,7 +613,13 @@ class HeadSwapper:
         ghosting e dettagli "trascinati". Sulle guance/fronte resta pieno.
         """
         key = id(src_entry.get("_face"))
-        kps = np.asarray(target_face.kps, np.float32)
+        # kps_sm: geometria smorzata usata per incollare il viso. Se il
+        # blend usa i kps grezzi mentre il ritaglio e' stato fatto sui kps
+        # smorzati, il warp fra due frame consecutivi non combacia: il
+        # blending stesso diventa una fonte di jitter.
+        kps = (kps_sm if kps_sm is not None
+               else np.asarray(target_face.kps, np.float32))
+        kps = np.asarray(kps, np.float32)
         prev = self._prev.get(key)
 
         if prev is None:
@@ -467,12 +643,13 @@ class HeadSwapper:
         mask = feather(base_mask, self.blend)
 
         # Zone ad alta frequenza: peso temporale ridotto
-        weight = np.full(out.shape[:2], self.temporal, dtype=np.float32)
+        base = self.temporal if forza is None else forza
+        weight = np.full(out.shape[:2], base, dtype=np.float32)
         if labels is not None:
             hf = high_freq_mask(labels)
             if hf.any():
                 # occhi/naso/bocca: solo 40% del temporal
-                weight = np.where(hf > 0, self.temporal * 0.40, weight)
+                weight = np.where(hf > 0, base * 0.40, weight)
 
         valid = cv2.warpAffine(np.full(prev_img.shape[:2], 255, np.uint8),
                                A[:2], (out.shape[1], out.shape[0]),
