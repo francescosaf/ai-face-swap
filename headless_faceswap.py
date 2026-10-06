@@ -222,6 +222,32 @@ def encode_video(frame_dir: Path, source: Path, output: Path, fps: float,
     subprocess.run(cmd, check=True)
 
 
+SOGLIA_DETECTOR_RIDOTTA = 0.25
+
+
+def _soglia_ridotta(many):
+    """Detector a 0.25 invece che 0.5, avvolgendo get_many_faces.
+
+    A 0.5 i volti appena fuori dal bordo o in moto non escono, e quando un
+    volto marginale viene trovato lo scambiato resta quello sbagliato: nel
+    video con IG il frame 348 perdeva il soggetto principale. Qui sotto le
+    soglie costano 3 volti in piu' su 38, quasi tutti reali, e li scarta
+    comunque la mappa. La soglia va rimessa a posto a ogni chiamata: e'
+    una proprieta' del modello, condivisa con gli altri passaggi.
+    """
+    def avvolto(frame):
+        from modules.face_analyser import get_face_analyser
+        det = get_face_analyser().det_model
+        precedente = getattr(det, "det_thresh", None)
+        try:
+            det.det_thresh = SOGLIA_DETECTOR_RIDOTTA
+            return many(frame)
+        finally:
+            if precedente is not None:
+                det.det_thresh = precedente
+    return avvolto
+
+
 def load_modules(providers, enhancer, det_size, mode):
     import modules.globals as g
     g.execution_providers = providers
@@ -231,7 +257,11 @@ def load_modules(providers, enhancer, det_size, mode):
     # il detector a 0.5 perde i volti ai margini e in movimento: in
     # faceswap la mappa decide comunque chi scambiare, quindi si puo'
     # abbassare. In headswap cambierebbe il tracciamento, resta 0.5.
-    g.det_thresh_ridotto = (mode == "faceswap")
+    # Va fatto qui e non dentro face_analyser perche' dlfolder e' una
+    # repo separata (upstream) esclusa dal versionamento: una modifica
+    # li' sparisce al prossimo rebuild.
+    if mode == "faceswap":
+        many = _soglia_ridotta(many)
     g.opacity = 1.0
     g.mouth_mask = False
     g.sharpness = 0.0
