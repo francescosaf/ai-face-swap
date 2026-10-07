@@ -38,6 +38,30 @@ Raggiunto.
 - ✅ Notebook Colab che riusa gli stessi script, senza logica duplicata
 - ✅ Verifica oggettiva: esce con codice di errore se lo swap non è avvenuto
 - ✅ Durata e audio dell'originale conservate
+- ✅ **Faceswap multi-persona**: `abbina_volti.py` produce la mappa
+  frame → persona → foto e `--mappa-file` la applica, senza dipendere dal
+  numero di cluster trovati
+- ✅ **Flickering**: le due cause sono state trovate coi numeri e corrette
+  (GFPGAN, soglia del detector a 0.50), con `misura_flicker.py` per misurarlo
+
+## Risultato misurato (faceswap multi-persona)
+
+Video 720×1280, 24 fps, 481 frame, 6,2 MB, tre foto, `--mode faceswap`
+con `--mappa-file`, `--det-size 1024`, `--no-enhancer`, `--crf 17`:
+
+| | valore |
+|---|---|
+| output | 3,4 MB (originale 6,2) |
+| volti sostituiti | 433 su 481 |
+| volti lasciati intatti per mappa (`-1`) | 84 |
+| volti scartati perché fuori soglia | 18 |
+| frame senza interruzioni sul 15° secondo | sì (prima no) |
+| audio | AAC, conservato |
+
+Il secondo video (Samay, 8 persone, `--assegna 1,1,2,0,0,0,0,1`) è approvato
+a occhio: 422 swap su 409 frame, 25 ripresi dai frame adiacenti, 0 lasciati
+originali per caso, allineamento 2,72 px, overlap 95,3%, eccesso di bordo
++0,0, flicker +0,048 px (identico all'originale).
 
 ## Risultato misurato
 
@@ -60,19 +84,27 @@ La versione precedente era **rifiutata in test visivo**: area testa da 0.36x a
 
 ## Cosa NON è risolto
 
-- **L'abbinamento foto↔persona è manuale.** Le embedding di una foto e di un
-  volto del video distano 0.90+: sono persone diverse, non un errore. Quindi
-  non si può dedurre a chi appartiene il soggetto di una foto. Serve guardare i
-  provini e usare `--map`.
+- **L'abbinamento foto↔persona è ancora umano**, ma non più a mano libera:
+  le embedding di una foto e di un volto del video distano 0.90+ (sono
+  persone diverse, non un errore), quindi il soggetto va riconosciuto. Ormai
+  si guardano le `persona_N.png` di `abbina_volti.py` e si scrive
+  `--assegna 1,1,2,0,...`: il resto — bbox per frame, IoU, frame adiacenti —
+  lo fa il codice. Resta non deducibile **quale** foto spetti a chi.
 - **Il clustering non è garantito.** Le embedding dello stesso volto variano
-  fino a ~0.56 fra frame consecutivi. Sul video di prova dà 4 identità
-  (le due principali a 43 e 24 apparizioni); su un video con molta gente o
-  pose molto diverse può frammentarsi.
+  fino a ~0.56 fra frame consecutivi. Sul video di prova dà 4 identità (le
+  due principali a 43 e 24 apparizioni); su un video con molta gente o pose
+  molto diverse può frammentarsi. Per questo `--mappa-file` **ignora il
+  clustering** e decide frame per frame: il numero di cluster smette di
+  essere un rischio.
 - **I frame sono PNG su disco**: un video molto lungo occupa molto spazio.
   Conviene lavorare in segmenti.
-- **Il percorso di enhancement GFPGAN non è mai stato testato**: tutte le run
-  hanno usato `--no-enhancer`, quindi `gfpgan-1024.onnx` non è mai stato
-  scaricato. La flag esiste e il codice è predisposto, ma non è verificata.
+- **GFPGAN è provato e non va bene**: spinge i dettagli della pelle al 400%
+  dell'originale e quel contrasto in più sulle zone non swappate si legge come
+  sfarfallio. Il percorso resta nel codice ma va considerato rotto; il faceswap
+  passa sempre per `--no-enhancer`.
+- **Dettagli del volto al 58–69% dell'originale** in faceswap: il volto
+  risulta più morbido. Con `--no-enhancer` l'unica leva rimasta è
+  `--det-size`, non l'enhancement.
 
 ## Correzioni rispetto alle ipotesi iniziali
 
@@ -103,6 +135,15 @@ difetti segnalati sono risolti e misurati.
 
 Test finali in `~/Downloads/TestFaceSwap`: `test1.mp4` (fast), `test2.mp4`
 (high), `test3.mp4` (maximum). Conservati anche i run intermedi.
+
+**Stato del faceswap multi-persona**: raggiunto e verificato a occhio su due
+video. Il sintomo che aveva bloccato il lavoro — «il volto torna
+all'originale a intermittenza» — aveva due cause: il detector a 0.50 che
+perdeva i volti ai margini e in moto, e i frame senza riga nella mappa. Un
+terzo difetto, collegato, faceva assegnare la stessa foto a **tutti** i volti
+di un frame senza righe, scambiando la seconda persona per errore. Lo
+sfarfallio puro veniva invece da GFPGAN. Le cause si misurano con
+`misura_flicker.py` e `diagnosi_difetti.py`.
 
 Cosa resta fuori portata: `simswap` e `hififace` non sono utilizzabili con
 l'ArcFace di Deep-Live-Cam. Con i soli modelli ONNX disponibili, inswapper

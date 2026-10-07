@@ -354,7 +354,7 @@ def main() -> int:
     ap.add_argument("--provider", choices=["cuda", "coreml", "cpu"])
     ap.add_argument("--no-enhancer", action="store_true",
                     help="disattiva GFPGAN. Sul questo materiale spingeva i "
-                         "dettagli della pelle al 400% dell'originale, e "
+                         "dettagli della pelle al 400%% dell'originale, e "
                          "quel contrasto in piu' sul video originale si legge "
                          "come sfarfallio.")
     ap.add_argument("--mappa-file", type=Path, default=None,

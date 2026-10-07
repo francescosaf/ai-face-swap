@@ -2,15 +2,19 @@
 
 ## Repository
 
-Due soli entry point, condivisi da CLI, notebook e verifica. Tutta la logica sta
+Tre entry point, condivisi da CLI, notebook e verifica. Tutta la logica sta
 in questi file; `dlfolder/` è un clone stock di Deep-Live-Cam **non modificato**,
 escluso da Git perché contiene venv e modelli.
 
 | File | Ruolo |
 |---|---|
 | `headless_faceswap.py` | entry point: risolve gli input, sceglie l'hardware, sostituisce |
+| `abbina_volti.py` | censimento: cluster + tabella frame → persona → foto |
 | `video_face_roster.py` | analizzatore: conta le persone, produce provini e config |
 | `verifica_swap.py` | misura se lo swap è avvenuto davvero |
+| `diagnosi_difetti.py` | melting, warping, allineamento, bordo |
+| `misura_flicker.py` | sfarfallio frame per frame rispetto all'originale |
+| `verifica_headswap.py` | distingue head swap da face swap |
 | `face_parsing.py` | wrapper BiSeNet: segmentazione della testa in 19 classi |
 | `head_swap.py` | composizione dell'head swap |
 | `TestFaceSwap.ipynb` | Colab: esegue gli script sopra con `subprocess` |
@@ -32,10 +36,15 @@ cache per il video.
 | `inswapper_128` | `inswapper_128.onnx` (529 MB) | sostituisce il volto interno |
 | `inswapper_128_fp16` | scaricato solo su CUDA | variante half precision |
 | BiSeNet ResNet18 | `bisenet_resnet18.onnx` (51 MB, MIT) | segmenta la testa in 19 classi |
-| GFPGAN | `gfpgan-1024.onnx` | **mai testato**, vedi GOAL.MD |
+| GFPGAN | `gfpgan-1024.onnx` | enhancement: **da non usare**, vedi sotto |
 | `buffalo_l` | cache InsightFace | detector + embedding |
 
 InsightFace scarica `buffalo_l` da solo in `~/.insightface/models/`.
+
+**GFPGAN è stato provato ed è la causa dello sfarfallio**: spingeva i dettagli
+della pelle al 400% dell'originale, e quel contrasto in più sul video non
+swappato si legge come flickering. Tutte le run di faceswap passano per
+`--no-enhancer`; il percorso resta nel codice ma va considerato rotto.
 
 Il parsing BiSeNet usa le 19 classi di CelebAMask-HQ:
 
@@ -91,6 +100,59 @@ derivano dai dati del video.
 Il video di prova ha una peculiarità: il sorgente è stato **generato con un'altra
 applicazione AI**, e i volti sintetici hanno embedding più instabili di quelli
 reali. È il motivo per cui la media sui tracciati serve più del solito.
+
+## Layer 5b — Mappa frame → foto (faceswap multi-persona)
+
+Con più persone, associare le foto **per persona** non basta: due algoritmi di
+raggruppamento possono contare identità diverse, e `--map` finisce sugli
+indici sbagliati con un output plausibile ma sulla persona errata. Il passo
+affidabile è la mappa **per frame**, prodotta da `abbina_volti.py`.
+
+```
+video ── InsightFace ── tracciati ── Otsu ── cluster
+                                              │
+foto ── embedding ── somiglianze (solo informative)
+                                              │
+                              --assegna 1,1,2,0,0,0,0,1   ← deciso a mano
+                                              │
+                              match_frame_foto.csv
+                                frame,persona,x1,y1,x2,y2,
+                                foto_assegnata,foto_indice
+                                              │
+                    headless_faceswap.py --mappa-file ... CSV
+```
+
+Le somiglianze `sim_*.jpeg` vengono **riportate mai usate**: se il soggetto
+della foto non è nel video sono rumore (0.0–0.2) e assegnare in automatico
+produce abbinamenti senza senso. `foto_indice` è 0-based sull'ordine di
+`--photo`, e `-1` lascia il volto originale.
+
+**Scelta della riga**, per ogni volto rilevato in ogni frame
+(`headless_faceswap.py`):
+
+1. fra le righe del frame si prende l'IoU maggiore, valido se `≥ 0,30`;
+2. se il frame non ha righe, si cercano i **6 frame adiacenti** e si prende la
+   riga più vicina, con distanza fra i centri normalizzata sulla **larghezza
+   del volto rilevato**: una larghezza è il limite, oltre è un'altra persona;
+3. nessuna riga valida → il volto resta com'è e viene contato (`Altre: N`).
+
+Il passo 2 è stato un bug vero: la normalizzazione sul lato maggiore del bbox
+assorbiva 450 px di distanza per un volto alto 600 px, quindi la seconda
+persona di un piano prendeva la foto del soggetto principale.
+
+**Soglia del detector.** `get_many_faces` lavora a 0.50, ma i volti ai margini
+e in moto escono con 0.26–0.47 e venivano scartati: il frame tornava
+all'originale e quello dopo riprendeva, un lampeggio leggibile come flickering.
+In `--mode faceswap` la soglia viene abbassata a **0.25 per tutti i frame**
+avvolgendo `get_many_faces` (`_soglia_ridotta`): la mappa decide comunque chi
+sostituire, quindi cambia solo quanti volti vengono *visti*, non quale foto
+gli venga data. In `headswap` resta 0.50, dove la soglia entra nel
+tracciamento. L'eventuale retry da 0.25 su chiamata vuota non basta: se a
+0.50 viene trovato un volto marginale, il volto giusto resta fuori.
+
+La scelta sta nel nostro script e non in `dlfolder/modules/face_analyser.py`:
+`dlfolder/` è una repo separata con remote upstream, esclusa dal
+versionamento, e una modifica lì andrebbe persa al prossimo rebuild.
 
 ## Layer 6 — Head swap
 

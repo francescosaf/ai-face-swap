@@ -108,7 +108,7 @@ Al primo avvio vengono scaricati da soli:
 - `bisenet_resnet18.onnx` (51 MB, MIT, per l'head swap)
 - `buffalo_l` di InsightFace, nella cache utente
 
-##Uso
+## Uso
 
 ### Locale
 
@@ -139,15 +139,87 @@ diventare obsoleto rispetto alla CLI.
 | Flag | Effetto |
 |---|---|
 | `--mode headswap\|faceswap` | predefinita `headswap` |
+| `--mappa-file CSV` | **consigliato**: foto per frame, da `abbina_volti.py` |
 | `--map 0,1,0` | fissa quale foto per ogni persona (indice foto) |
+| `--det-size 1024` | ingresso del detector: più alto = volti piccoli trovati meglio |
 | `--identities N` | forza il numero di persone distinte nel video |
+| `--no-enhancer` | salta GFPGAN: **necessario** in faceswap, vedi sotto |
+| `--swapper inswapper\|hyperswap\|hififace` | modello di sostituzione |
+| `--stabilizza 0.6` | smorza i keypoint del detector (0 = off) |
+| `--temporal 0.35` | smorzamento temporale (0 = off) |
+| `--crf 17` | qualità x264 (più basso = migliore) |
+| `--zoom 1.4` | ingrandisce il ritaglio prima dello swap |
 | `--prompt "..."` | registra il prompt nel config (vedi sotto) |
-| `--no-enhancer` | salta GFPGAN, più veloce |
 | `--provider cuda\|coreml\|cpu` | forza il provider ONNX |
-| `--temporal 0.35` | smorzamento temporale contro il flickering (0 = off) |
 | `--harmonize 1.0` | allineamento del tono pelle (0 = off) |
 | `--limit-frames N` | prova rapida sui primi N frame |
 | `--save-masks DIR` | salva maschere e viste di debug |
+| `--keep-frames` | non cancella i PNG estratti |
+
+## Faceswap multi-persona: `abbina_volti.py` → mappa
+
+Con più persone il numero trovato dal clustering **non è affidabile**: due
+algoritmi diversi possono contare identità diverse, e `--map` finirebbe sugli
+indici sbagliati con un risultato plausibile ma sulla persona errata. La strada
+sicura è passare la mappa per **frame**.
+
+```bash
+PY=./dlfolder/venv/bin/python
+
+# 1. censimento + assegnazione (indici 0-based nell'ordine di --photo)
+$PY abbina_volti.py --video clip.mp4 \
+    --photo foto3.jpeg foto1.jpeg foto2.jpeg \
+    --out ./match_clip --det-size 1024 \
+    --min-rilevamenti 1 --min-px 0 \
+    --assegna 1,1,2,0,0,0,0,1 --provider cpu
+
+# 2. swap leggendo la mappa per frame (clustering interno ignorato)
+$PY headless_faceswap.py --mode faceswap \
+    --video clip.mp4 --photo foto3.jpeg foto1.jpeg foto2.jpeg \
+    --mappa-file ./match_clip/match_frame_foto.csv \
+    --det-size 1024 --no-enhancer --output ./out.mp4
+```
+
+`abbina_volti.py` produce:
+
+| file | ruolo |
+|---|---|
+| `persona_N.png` | griglia di volti campione: riconosci chi è chi |
+| `match_riepilogo.md` | tabella leggibile con somiglianze e intervalli frame |
+| `match_frame_foto.csv` | `frame,persona,x1,y1,x2,y2,sim_*,foto_assegnata,foto_indice` |
+| `match_config.json` | config pronto per `headless_faceswap.py` |
+
+- **`foto_indice` è 0-based sull'ordine di `--photo`**; `-1` lascia il volto
+  originale. Attenzione: `0` è un indice valido, non un "mancante".
+- **`--det-size` deve essere uguale** nei due script: i bbox del CSV sono
+  prodotti a quella dimensione e l'abbinamento per bbox non combacia se le due
+  corrono diverse.
+- **`--min-rilevamenti` / `--min-px`** decidono quali cluster contano come
+  persone visibili. `1` e `0` li disattivano: serve quando un cluster reale
+  ha poche apparizioni, altrimenti i frame di quella persona restano
+  scambiati per originale.
+- Le somiglianze nel CSV sono riportate, mai usate per decidere: se il
+  soggetto della foto non è nel video sono rumore (0.0–0.2).
+
+**Come un volto sceglie la propria foto.** Per ogni volto rilevato nel frame:
+
+1. si prende la riga del CSV con **IoU maggiore**, ma solo se `≥ 0,30`;
+2. se il frame non ha righe, si guardano i **6 frame adiacenti** e si sceglie
+   la riga più vicina, con distanza normalizzata sulla **larghezza del volto
+   rilevato** — una larghezza è il limite. Sopra, il volto è un'altra
+   persona: la seconda persona di un piano resta intatta invece di prendere
+   la foto del soggetto principale;
+3. se nessuna riga supera la soglia, il volto resta com'è e viene contato nel
+   log (`Altre: N volti lasciati com'e'`).
+
+Il limite è che il detector deve **trovare** il volto: sui margini e in moto
+perdeva soggetti con punteggio 0.26–0.47 sotto la soglia di 0.50. In
+`--mode faceswap` la soglia viene abbassata a 0.25 per tutti i frame
+(`_soglia_ridotta` in `headless_faceswap.py`): la mappa decide comunque chi
+scambiare, quindi non cambia l'identità di ciò che viene sostituito. In
+`headswap` resta 0.50, dove la soglia partecipa al tracciamento. La modifica
+sta nel nostro script e non in `dlfolder/`, che è una repo separata esclusa
+dal versionamento.
 
 ## Come viene scelto chi è chi
 
@@ -156,7 +228,7 @@ tue foto.** Il confronto fra una foto e un volto del video dà distanze
 embedding molto alte (0.90+): non è un errore, significa che sono persone
 diverse.
 
-Le persone sono numerate **in ordine di prima apparizione** nel video:/persona
+Le persone sono numerate **in ordine di prima apparizione** nel video: `persona
 1` è la prima che si vede, `persona 2` la successiva, e così via. Le foto
 vengono abbinate in quello stesso ordine. Nessun soggetto è codificato nel
 codice: con N foto e M persone si abbinano le prime N, e `--map` permette di
@@ -290,10 +362,10 @@ statiche incollate al centro e cambiate ogni 5 s. La zona centrale è immobile
 360 frame su 409. Il face swap reale è quello prodotto da `headless_faceswap.py`.
 ---
 
-## Verifica oggettiva: due strumenti nuovi
+## Verifica oggettiva: tre strumenti nuovi
 
 Fin qui i difetti si guardavano a occhio, il che non scala e non dà
-numeri. Esistono ora due misure automatiche.
+numeri. Esistono ora tre misure automatiche.
 
 ### `diagnosi_difetti.py` — melting, warping, allineamento
 
@@ -323,6 +395,36 @@ Tre correzioni rese necessarie dai dati, non da supposizioni:
   head swap il detector dimensiona il box anche sui capelli, quindi il suo
   centro si sposta di 7-8 px *anche quando il volto è allineato*. Il
   baricentro dei landmark si sposta di 2.3 px.
+
+### `misura_flicker.py` — sfarfallio frame per frame
+
+```bash
+./dlfolder/venv/bin/python misura_flicker.py --video ORIGINALE OUT.mp4 \
+    --da 0 --a 120
+```
+
+Confronta l'identità del volto fra un frame e il successivo, nel video
+scambiato e in quello originale. **Si legge solo l'eccesso**: l'originale ha
+di suo una variazione di ~0.04–0.05, quindi 0.05 nello swap non significa
+nulla. Soglie: spostamento 6 px, eccesso di bordo +6, overlap 85%.
+
+### Il flickering aveva due cause, entrambe trovate coi numeri
+
+**1. GFPGAN.** L'enhancer non è neutro: spingeva i dettagli della pelle al
+400% dell'originale e quel contrasto in più, sul video non swappato, si legge
+come sfarfallio. È il motivo per cui tutte le run di faceswap usano
+`--no-enhancer`, non solo per velocità.
+
+**2. Il detector che perde e ritrova il volto.** Con la soglia a 0.50 i volti
+ai margini e in moto uscivano con punteggio 0.26–0.47 e venivano scartati: il
+frame tornava all'originale, quello dopo riprendeva lo swap. Effetto
+lampeggiante identico a un difetto di blending, ma era un problema di
+rilevamento. Corretto abbassando la soglia in faceswap (vedi
+`_soglia_ridotta`).
+
+Una terza falsa pista: `--stabilizza` (default 0) e `--temporal` smorzano i
+movimenti, ma non correggono un volto che sparisce. Applicarli su questo
+sintomo maschera la causa.
 
 ### `verifica_headswap.py` — distingue head swap da face swap
 
